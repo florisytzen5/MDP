@@ -1,0 +1,180 @@
+// =============================================================
+// Sisal / El Palmar — Global Mangrove Watch v3 (1996–2020)
+// 11-epoch mangrove extent, with an on-map legend.
+// Bunting et al. — GMW v3, Zenodo doi:10.5281/zenodo.6894273
+// =============================================================
+
+var aoi = ee.Geometry.Rectangle([-90.45, 20.80, -89.75, 21.35]);
+Map.centerObject(aoi, 11);
+Map.setOptions('SATELLITE');
+
+// If you get "Cannot perform analysis without auth token" only
+// on the GMW layers, swap to the alternative path below.
+var GMW = 'projects/earthengine-legacy/assets/projects/sat-io/open-datasets/GMW/extent/GMW_V3';
+// var GMW = 'projects/sat-io/open-datasets/GMW/extent/GMW_V3';
+
+var gmw = ee.ImageCollection(GMW).filterBounds(aoi);
+
+// ---- Palettes, defined once so map and legend cannot drift --
+var PAL = {
+  persistence: ['f2d9c4', 'd4b483', '9fbf6a', '3d7a37', '12301f'],
+  stable:  '12301f',
+  dynamic: 'd08770',
+  gain:    '3b8a80',
+  loss:    'a8492a',
+  giri:    'b48ead'
+};
+var P_MIN = 1, P_MAX = 11;
+
+// ---- 0. Inspect ---------------------------------------------
+print('GMW images over AOI:', gmw.size());
+print('Epoch labels (system:index):', gmw.aggregate_array('system:index'));
+
+// ---- 1. Binary layer per epoch ------------------------------
+var epochs = gmw.map(function (img) {
+  return img.select(0).gt(0).rename('mangrove').clip(aoi)
+    .copyProperties(img, ['system:index', 'system:time_start']);
+});
+
+// ---- 2. Extent per epoch ------------------------------------
+var areas = ee.FeatureCollection(epochs.map(function (img) {
+  var a = ee.Image(img).multiply(ee.Image.pixelArea()).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: aoi,
+    scale: 25, maxPixels: 1e10, tileScale: 4
+  });
+  return ee.Feature(null, {
+    epoch: ee.Image(img).get('system:index'),
+    area_ha: ee.Number(a.get('mangrove')).divide(1e4)
+  });
+}));
+
+print(ui.Chart.feature.byFeature(areas, 'epoch', ['area_ha'])
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: 'GMW mangrove extent in AOI, by epoch',
+    vAxis: {title: 'hectares'},
+    hAxis: {title: 'epoch', slantedText: true},
+    legend: {position: 'none'},
+    colors: ['2c6249']
+  }));
+
+// ---- 3. Persistence and derived masks -----------------------
+var nEpochs = epochs.size();
+var persistence = epochs.sum().rename('n_epochs');
+var stable  = persistence.gte(ee.Number(nEpochs).subtract(1));
+var dynamic = persistence.gte(1).and(stable.not());
+
+var sorted = epochs.sort('system:index');
+var firstE = ee.Image(sorted.first());
+var lastE  = ee.Image(sorted.sort('system:index', false).first());
+
+var giri = ee.ImageCollection('LANDSAT/MANGROVE_FORESTS').first()
+  .rename('m').clip(aoi).unmask(0);
+
+// ---- 4. Layers ----------------------------------------------
+Map.addLayer(persistence.selfMask(),
+  {min: P_MIN, max: P_MAX, palette: PAL.persistence},
+  '1. Epochs mapped as mangrove');
+Map.addLayer(stable.selfMask(),  {palette: [PAL.stable]},  '2. Stable core', false);
+Map.addLayer(dynamic.selfMask(), {palette: [PAL.dynamic]}, '3. Dynamic / fringe', false);
+Map.addLayer(lastE.eq(1).and(firstE.eq(0)).selfMask(),
+  {palette: [PAL.gain]}, '4. Gain, first→last', false);
+Map.addLayer(lastE.eq(0).and(firstE.eq(1)).selfMask(),
+  {palette: [PAL.loss]}, '5. Loss, first→last', false);
+Map.addLayer(giri.selfMask(), {palette: [PAL.giri]}, '6. Giri 2000', false);
+
+// =============================================================
+// LEGEND
+// =============================================================
+
+// Continuous colour bar: a horizontal longitude ramp rendered
+// with the same palette the layer uses.
+function colourBar(palette, min, max) {
+  var ramp = ee.Image.pixelLonLat().select('longitude')
+    .multiply((max - min) / 100).add(min)
+    .visualize({min: min, max: max, palette: palette});
+  return ui.Thumbnail({
+    image: ramp,
+    params: {bbox: '0,0,100,8', dimensions: '240x16', format: 'png'},
+    style: {stretch: 'horizontal', margin: '0px 8px', maxHeight: '20px'}
+  });
+}
+
+// One categorical swatch + label.
+function swatch(colour, label) {
+  return ui.Panel({
+    widgets: [
+      ui.Label('', {backgroundColor: '#' + colour, padding: '9px',
+                    margin: '0 8px 4px 0', border: '1px solid #888'}),
+      ui.Label(label, {margin: '0 0 6px 0', fontSize: '12px'})
+    ],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+}
+
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '10px 12px',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    width: '270px'
+  }
+});
+
+legend.add(ui.Label('Mangrove extent — GMW v3', {
+  fontWeight: 'bold', fontSize: '14px', margin: '0 0 8px 0'
+}));
+
+legend.add(ui.Label('Epochs mapped as mangrove', {
+  fontSize: '12px', fontWeight: 'bold', margin: '0 0 4px 0'
+}));
+legend.add(colourBar(PAL.persistence, P_MIN, P_MAX));
+legend.add(ui.Panel({
+  widgets: [
+    ui.Label(P_MIN + ' (transient)', {margin: '2px 0 0 0', fontSize: '11px'}),
+    ui.Label(P_MAX + ' (permanent)', {margin: '2px 0 0 0', fontSize: '11px'})
+  ],
+  layout: ui.Panel.Layout.Flow('horizontal'),
+  style: {stretch: 'horizontal', margin: '0 8px 8px 8px'}
+}));
+
+legend.add(ui.Label('Optional layers', {
+  fontSize: '12px', fontWeight: 'bold', margin: '6px 0 4px 0'
+}));
+legend.add(swatch(PAL.stable,  'Stable core (≥ n−1 epochs)'));
+legend.add(swatch(PAL.dynamic, 'Dynamic / fringe'));
+legend.add(swatch(PAL.gain,    'Gain, first → last epoch'));
+legend.add(swatch(PAL.loss,    'Loss, first → last epoch'));
+legend.add(swatch(PAL.giri,    'Giri 2000, for comparison'));
+
+legend.add(ui.Label(
+  'Gain and loss classes are ~58% and ~61% accurate at pixel ' +
+  'level. Treat as hypotheses, not findings.',
+  {fontSize: '10px', color: '666666', margin: '8px 0 0 0'}
+));
+
+Map.add(legend);
+
+// ---- 5. Export the sampling frame ---------------------------
+Export.image.toAsset({
+  image: stable.rename('mangrove_stable'),
+  description: 'sisal_gmw_stable_core',
+  assetId: 'projects/orbital-broker-507420-t1/assets/sisal_gmw_stable_core',
+  region: aoi,
+  scale: 25,
+  maxPixels: 1e10
+});
+
+print('GMW:',     gmw.first().projection().nominalScale());
+print('Giri:',    giri.projection().nominalScale());
+print('Landsat:', ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').first()
+                    .select('SR_B4').projection().nominalScale());
+
+// =============================================================
+// NOTES
+// GMW is EXTENT, not condition — SAR sees structure, not
+// greenness, so a thinning stand stays "mangrove" until it
+// falls over. That is what your NDVI work is for.
+// Epochs are irregular: 1996, 2007–2010, 2015–2020. Ends 2020,
+// so it says nothing about Milton.
+// =============================================================
