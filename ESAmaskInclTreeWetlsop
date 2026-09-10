@@ -1,0 +1,262 @@
+/*****************************************************************
+ * NDVI around Sisal, Yucatán — Google Earth Engine (Code Editor)
+ *
+ * Part A: Sentinel-2 monthly NDVI (2019–present), split by land cover
+ * Part B: Landsat 5/7/8/9 annual dry-season NDVI (1985–present),
+ *         cross-sensor harmonised, with a Sen's-slope trend map
+ *
+ * Paste into https://code.earthengine.google.com and press Run.
+ * Charts appear in the Console; click the pop-out icon on a chart
+ * to download its data as CSV.
+ *****************************************************************/
+
+// ---------------- SETTINGS ----------------
+// Box around Sisal: coast in the north, ciénaga/mangroves to the south.
+// Adjust or replace with a drawn geometry.
+var aoi = ee.Geometry.Rectangle([-90.12, 21.08, -89.94, 21.22]);
+
+var S2_START = '2019-01-01';      // S2 L2A over Yucatán starts ~late 2018
+var S2_END   = '2026-09-01';
+var CS_THRESHOLD = 0.6;           // Cloud Score+ clear threshold (0.5–0.65 typical)
+var MIN_COVERAGE = 0.5;           // drop months with <50% of mangrove pixels clear
+
+var LS_START_YEAR = 1985;
+var LS_END_YEAR   = 2026;
+var DRY_START_MONTH = 1;          // Jan–May dry-season composites: fewer clouds,
+var DRY_END_MONTH   = 5;          // and avoids comparing wet vs dry seasons
+
+// ---------------- LAND COVER MASKS ----------------
+// ESA WorldCover 2021 (10 m). NOTE: static 2021 snapshot -> areas lost
+// before 2021 are not in the mask (survivorship bias in historical series).
+var wc = ee.ImageCollection('ESA/WorldCover/v200').first().select('Map');
+var mangroveMask = wc.eq(95);
+var wetlandMask  = wc.eq(90);   // herbaceous wetland
+var treeMask     = wc.eq(10);   // tree cover (inland forest / dune scrub)
+
+function splitByClass(img) {
+  var n = img.select('NDVI');
+  return n.updateMask(mangroveMask).rename('Mangrove')
+    .addBands(n.updateMask(wetlandMask).rename('Herbaceous_wetland'))
+    .addBands(n.updateMask(treeMask).rename('Tree_cover'))
+    .copyProperties(img, ['system:time_start']);
+}
+
+// =================================================================
+// PART A — SENTINEL-2 MONTHLY NDVI
+// =================================================================
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate(S2_START, S2_END)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+  .linkCollection(csPlus, ['cs_cdf'])
+  .map(function (img) {
+    var clear = img.select('cs_cdf').gte(CS_THRESHOLD);
+    return img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+      .updateMask(clear)
+      .copyProperties(img, ['system:time_start']);
+  });
+
+// Monthly median composites
+var s2Start = ee.Date(S2_START);
+var nMonths = ee.Date(S2_END).difference(s2Start, 'month').floor();
+
+var monthly = ee.ImageCollection.fromImages(
+  ee.List.sequence(0, nMonths.subtract(1)).map(function (m) {
+    var s = s2Start.advance(m, 'month');
+    var sub = s2.filterDate(s, s.advance(1, 'month'));
+    return sub.median()
+      .set('system:time_start', s.millis())
+      .set('n', sub.size());
+  })
+).filter(ee.Filter.gt('n', 0));
+
+// Drop months where too few mangrove pixels are cloud-free
+var mangroveTotal = ee.Number(mangroveMask.selfMask().reduceRegion({
+  reducer: ee.Reducer.count(), geometry: aoi, scale: 20, maxPixels: 1e9
+}).get('Map'));
+
+monthly = monthly.map(function (img) {
+  var valid = ee.Number(img.select('NDVI').updateMask(mangroveMask).reduceRegion({
+    reducer: ee.Reducer.count(), geometry: aoi, scale: 20, maxPixels: 1e9
+  }).get('NDVI'));
+  return img.set('coverage', valid.divide(mangroveTotal));
+}).filter(ee.Filter.gte('coverage', MIN_COVERAGE));
+
+print('Sentinel-2 months kept:', monthly.size());
+
+var chartS2 = ui.Chart.image.series({
+  imageCollection: monthly.map(splitByClass),
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 10
+}).setOptions({
+  title: 'Sentinel-2 monthly NDVI by land cover — Sisal',
+  vAxis: {title: 'NDVI', viewWindow: {min: 0, max: 1}},
+  hAxis: {title: 'Date'},
+  lineWidth: 1.5, pointSize: 3, interpolateNulls: false
+});
+print(chartS2);
+
+// =================================================================
+// PART B — LANDSAT ANNUAL DRY-SEASON NDVI (1985–present)
+// =================================================================
+function prepLandsat(img) {
+  // QA_PIXEL bits 1–5: dilated cloud, cirrus, cloud, shadow, snow
+  var mask = img.select('QA_PIXEL').bitwiseAnd(62).eq(0);
+  var sr = img.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  return img.addBands(sr, null, true).updateMask(mask);
+}
+
+// TM/ETM+ -> OLI harmonisation (Roy et al. 2016, OLS coefficients).
+// Derived for ETM+; commonly applied to TM as an approximation.
+function ndviTM(img) {
+  var red = img.select('SR_B3').multiply(0.9047).add(0.0061);
+  var nir = img.select('SR_B4').multiply(0.8462).add(0.0412);
+  return nir.subtract(red).divide(nir.add(red)).rename('NDVI')
+    .copyProperties(img, ['system:time_start']);
+}
+function ndviOLI(img) {
+  return img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')
+    .copyProperties(img, ['system:time_start']);
+}
+
+var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2');
+// L7 only to mid-2013: bridges the L5–L8 gap; later years suffer
+// SLC-off striping and orbital drift.
+var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2').filterDate('1999-01-01', '2013-06-01');
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2');
+var l9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2');
+
+var tm  = l5.merge(l7).filterBounds(aoi).map(prepLandsat).map(ndviTM);
+var oli = l8.merge(l9).filterBounds(aoi).map(prepLandsat).map(ndviOLI);
+var landsat = tm.merge(oli);
+
+var annual = ee.ImageCollection.fromImages(
+  ee.List.sequence(LS_START_YEAR, LS_END_YEAR).map(function (y) {
+    var sub = landsat
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .filter(ee.Filter.calendarRange(DRY_START_MONTH, DRY_END_MONTH, 'month'));
+    return sub.median()
+      .set('system:time_start', ee.Date.fromYMD(y, 3, 1).millis())
+      .set('year', y)
+      .set('n', sub.size());
+  })
+).filter(ee.Filter.gt('n', 0));
+
+print('Landsat years with data:', annual.size());
+
+var chartLS = ui.Chart.image.series({
+  imageCollection: annual.map(splitByClass),
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 30
+}).setOptions({
+  title: 'Landsat dry-season NDVI by land cover — Sisal (Jan–May composites)',
+  vAxis: {title: 'NDVI', viewWindow: {min: 0, max: 1}},
+  hAxis: {title: 'Year'},
+  lineWidth: 1.5, pointSize: 4,
+  trendlines: {0: {type: 'linear', lineWidth: 1, opacity: 0.5}}
+});
+print(chartLS);
+
+// ---------- Per-pixel trend (Sen's slope, robust to outliers) ----------
+var sensInput = annual.map(function (img) {
+  var year = ee.Image.constant(ee.Number(img.get('year'))).float().rename('year');
+  return year.addBands(img.select('NDVI'));
+});
+var trend = sensInput.reduce(ee.Reducer.sensSlope());  // bands: slope, offset
+var slopePerDecade = trend.select('slope').multiply(10).rename('NDVI_per_decade');
+var vegMask = mangroveMask.or(wetlandMask).or(treeMask);
+
+// Mean trend within mangroves
+print('Mean mangrove NDVI trend (per decade):',
+  slopePerDecade.updateMask(mangroveMask).reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: aoi, scale: 30, maxPixels: 1e9
+  }));
+
+// ---------------- MAP ----------------
+Map.centerObject(aoi, 12);
+Map.setOptions('SATELLITE');
+
+var ndviVis = {min: 0, max: 0.9, palette: ['8c510a', 'd8b365', 'f6e8c3', 'c7e9c0', '41ab5d', '00441b']};
+var recentDry = s2.filterDate('2026-01-01', '2026-05-31').median().clip(aoi);
+Map.addLayer(recentDry, ndviVis, 'S2 NDVI — 2026 dry season median');
+
+Map.addLayer(mangroveMask.selfMask().clip(aoi), {palette: ['ff00ff']},
+  'WorldCover 2021 mangroves', false);
+
+var trendVis = {min: -0.15, max: 0.15, palette: ['b2182b', 'ef8a62', 'f7f7f7', '67a9cf', '2166ac']};
+Map.addLayer(slopePerDecade.updateMask(vegMask).clip(aoi), trendVis,
+  'Landsat NDVI trend per decade (red = decline)');
+
+Map.addLayer(ee.Image().paint(aoi, 0, 2), {palette: ['ffff00']}, 'AOI');
+
+// ---------------- LEGEND ----------------
+// Continuous colour bar built from the same palette as the layer
+function makeColorBar(title, vis, minLabel, midLabel, maxLabel) {
+  var bar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select(0),
+    params: {
+      bbox: [0, 0, 1, 0.1], dimensions: '200x12', format: 'png',
+      min: 0, max: 1, palette: vis.palette
+    },
+    style: {stretch: 'horizontal', margin: '0 8px', maxHeight: '16px'}
+  });
+  var labels = ui.Panel({
+    widgets: [
+      ui.Label(minLabel, {margin: '2px 8px', fontSize: '11px'}),
+      ui.Label(midLabel, {margin: '2px 8px', fontSize: '11px',
+                          textAlign: 'center', stretch: 'horizontal'}),
+      ui.Label(maxLabel, {margin: '2px 8px', fontSize: '11px'})
+    ],
+    layout: ui.Panel.Layout.flow('horizontal')
+  });
+  return ui.Panel([
+    ui.Label(title, {fontWeight: 'bold', fontSize: '12px', margin: '8px 8px 4px 8px'}),
+    bar, labels
+  ]);
+}
+
+// Single-colour swatch for categorical layers
+function makeSwatch(color, name) {
+  return ui.Panel([
+    ui.Label('', {backgroundColor: '#' + color, padding: '7px', margin: '2px 6px 2px 8px'}),
+    ui.Label(name, {fontSize: '12px', margin: '2px 0'})
+  ], ui.Panel.Layout.flow('horizontal'));
+}
+
+var legend = ui.Panel({style: {position: 'bottom-left', width: '270px', padding: '6px'}});
+legend.add(ui.Label('Legend', {fontWeight: 'bold', fontSize: '14px', margin: '0 8px'}));
+
+legend.add(makeColorBar(
+  'NDVI — Sentinel-2, 2026 dry season',
+  ndviVis, '0 (bare/water)', '0.45', '≥0.9 (dense)'));
+
+legend.add(makeColorBar(
+  'NDVI trend per decade — Landsat ' + LS_START_YEAR + '–' + LS_END_YEAR,
+  trendVis, '≤ −0.15 decline', '0', '≥ +0.15 gain'));
+legend.add(ui.Label(
+  'Sen\'s slope of Jan–May composites; only WorldCover 2021 vegetation classes shown.',
+  {fontSize: '10px', color: '666', margin: '0 8px 4px 8px'}));
+
+legend.add(makeSwatch('ff00ff', 'Mangroves (WorldCover 2021, hidden by default)'));
+legend.add(makeSwatch('ffff00', 'Study area'));
+
+Map.add(legend);
+
+// ---------------- EXPORT (optional) ----------------
+// Annual class means as CSV to Google Drive (Tasks tab -> Run)
+var annualTable = annual.map(splitByClass).map(function (img) {
+  var stats = img.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: aoi, scale: 30, maxPixels: 1e9
+  });
+  return ee.Feature(null, stats)
+    .set('year', ee.Date(img.get('system:time_start')).get('year'));
+});
+Export.table.toDrive({
+  collection: annualTable,
+  description: 'Sisal_annual_dryseason_NDVI_by_class',
+  fileFormat: 'CSV'
+});
