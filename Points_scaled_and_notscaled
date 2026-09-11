@@ -1,33 +1,30 @@
 // =====================================================================
 // GMW v3.0 vs ESA WorldCover 2021 mangroves, plus a multi-epoch
 // persistence gradient for deliberate point picking.
-// Paste into the Earth Engine Code Editor. Run AFTER your "aoi" polygon
-// is already defined (drawn/imported), since this script uses it directly.
+// Paste into the Earth Engine Code Editor. Self-contained - the AOI
+// polygon is hardcoded below, no drawn import needed for this one.
 // =====================================================================
 
-var geometry = /* color: #d63000 */ee.Geometry.MultiPoint(),
-    aoi = 
-    /* color: #98ff00 */
-    /* shown: false */
-    ee.Geometry.Polygon(
-        [[[-90.05041551503234, 21.162924684073946],
-          [-90.09495298591237, 21.158981726153797],
-          [-90.12053053107839, 21.141531063671124],
-          [-90.12018720832448, 21.07859556361946],
-          [-90.05066435065847, 21.07849757664358],
-          [-89.93977110114675, 21.113251544607984],
-          [-89.93925611701589, 21.21314383673432],
-          [-90.00933715735849, 21.174100452704874],
-          [-90.00920841132577, 21.16833774731217],
-          [-90.01991318489279, 21.16485600403262],
-          [-90.0310282590505, 21.162574817466144],
-          [-90.03858135963644, 21.161774392793973],
-          [-90.04819439674581, 21.159733290287747],
-          [-90.05016850258077, 21.16581649311989]]]);
-          
 // ---------- Settings ----------
-// Area of interest: your existing polygon, named "aoi"
-var AOI = aoi;
+// Area of interest: hardcoded from your actual drawn polygon (14 vertices,
+// west of Sisal), so this script doesn't depend on a fragile drawn import
+// that resets every time you start a fresh script - the exact issue that
+// caused the repeated "aoi is not defined" errors earlier.
+var AOI = ee.Geometry.Polygon(
+    [[[-90.05041551503234, 21.162924684073946],
+      [-90.09495298591237, 21.158981726153797],
+      [-90.12053053107839, 21.141531063671124],
+      [-90.12018720832448, 21.07859556361946],
+      [-90.05066435065847, 21.07849757664358],
+      [-89.93977110114675, 21.113251544607984],
+      [-89.93925611701589, 21.21314383673432],
+      [-90.00933715735849, 21.174100452704874],
+      [-90.00920841132577, 21.16833774731217],
+      [-90.01991318489279, 21.16485600403262],
+      [-90.0310282590505, 21.162574817466144],
+      [-90.03858135963644, 21.161774392793973],
+      [-90.04819439674581, 21.159733290287747],
+      [-90.05016850258077, 21.16581649311989]]]);
 
 Map.addLayer(AOI, {color: 'blue'}, 'AOI', false);
 
@@ -81,6 +78,99 @@ print('GMW ' + GMW_YEAR + ' only (km²)', gmwOnly);
 print('ESA 2021 only (km²)', esaOnly);
 print('Jaccard agreement (both / union)', both.divide(union));
 print('Net difference ESA − GMW (km²)', esaOnly.subtract(gmwOnly));
+
+// ---------- Proportional stratified sample across the 3 classes ----------
+// Classes (from `comp` above): 1 = GMW only (red), 2 = ESA only (yellow),
+// 3 = both (green). Total fixed at 150 points, split IN PROPORTION to each
+// class's actual pixel count within the AOI - e.g. if green covers 100x
+// more area than red, green gets ~100x more points, not an equal 50/50/50
+// split. Reuses the area sums already computed above (gmwOnly, esaOnly,
+// both) since area proportions and pixel-count proportions are the same
+// ratio at a fixed scale.
+var TOTAL_POINTS = 150;
+var totalArea = gmwOnly.add(esaOnly).add(both);
+
+var nRed = gmwOnly.divide(totalArea).multiply(TOTAL_POINTS).round();
+var nYellow = esaOnly.divide(totalArea).multiply(TOTAL_POINTS).round();
+var nGreen = both.divide(totalArea).multiply(TOTAL_POINTS).round();
+
+// Rounding each class independently can leave the total slightly off 150
+// (e.g. 149 or 151) - assign the leftover/deficit to whichever class is
+// largest (typically "both"/green here) so the total is always exactly 150.
+var roundedTotal = nRed.add(nYellow).add(nGreen);
+var remainder = ee.Number(TOTAL_POINTS).subtract(roundedTotal);
+nGreen = nGreen.add(remainder);
+
+print('Points allocated - red (GMW only):', nRed);
+print('Points allocated - yellow (ESA only):', nYellow);
+print('Points allocated - green (both):', nGreen);
+
+// IMPORTANT: mask out class 0 ("neither") before sampling. classValues
+// below only lists [1, 2, 3], but comp still has class-0 pixels present
+// and unmasked - leaving numPoints set (even though classPoints is also
+// given) causes it to apply as a fallback default FOR class 0, silently
+// sampling extra unwanted points from background pixels. Masking class 0
+// out entirely closes that off regardless of other parameters.
+var compForSampling = comp.updateMask(comp.gt(0));
+
+var stratifiedPoints = compForSampling.stratifiedSample({
+  numPoints: 0, // required by the API, but unused: class 0 is masked out
+                // above and classes 1-3 are fully covered by classPoints,
+                // so there's no unmasked class left for this to apply to
+  classBand: 'class',
+  region: AOI,
+  scale: SCALE,
+  classValues: [1, 2, 3],
+  classPoints: [nRed, nYellow, nGreen],
+  seed: 42,
+  geometries: true
+});
+
+print('Total proportional sample points generated (should be exactly 150):',
+  stratifiedPoints.size());
+
+// Split by class and color-match to the comparison layer (red/yellow/green)
+// so you can visually confirm the proportions, rather than uniform dots
+// that don't distinguish which class each point came from.
+var pointsRed = stratifiedPoints.filter(ee.Filter.eq('class', 1));
+var pointsYellow = stratifiedPoints.filter(ee.Filter.eq('class', 2));
+var pointsGreen = stratifiedPoints.filter(ee.Filter.eq('class', 3));
+
+Map.addLayer(pointsRed, {color: '#e31a1c'}, 'Sample points - red (GMW only)');
+Map.addLayer(pointsYellow, {color: '#ffd92f'}, 'Sample points - yellow (ESA only)');
+Map.addLayer(pointsGreen, {color: '#1b9e77'}, 'Sample points - green (both)');
+
+// ---------- Equal allocation across the 3 classes (alternative to above) ----------
+// Same 150 total, but split evenly - 50 per class - regardless of how much
+// area each class actually covers. Unlike the proportional version above,
+// this treats the smallest class (red, GMW-only, likely the rarest here)
+// the same as the largest (green, "both"), which oversamples small/rare
+// areas relative to their true extent - sometimes desirable if you
+// specifically want enough points to characterize a rare class, rather
+// than a representative sample of the whole area.
+var POINTS_PER_CLASS = 50; // 3 classes x 50 = 150 total
+
+var equalPoints = compForSampling.stratifiedSample({
+  numPoints: 0, // required by the API, unused - see note above
+  classBand: 'class',
+  region: AOI,
+  scale: SCALE,
+  classValues: [1, 2, 3],
+  classPoints: [POINTS_PER_CLASS, POINTS_PER_CLASS, POINTS_PER_CLASS],
+  seed: 42,
+  geometries: true
+});
+
+print('Total equal-allocation sample points generated (should be exactly 150):',
+  equalPoints.size());
+
+var equalPointsRed = equalPoints.filter(ee.Filter.eq('class', 1));
+var equalPointsYellow = equalPoints.filter(ee.Filter.eq('class', 2));
+var equalPointsGreen = equalPoints.filter(ee.Filter.eq('class', 3));
+
+Map.addLayer(equalPointsRed, {color: '#e31a1c'}, 'Equal sample - red (GMW only)', false);
+Map.addLayer(equalPointsYellow, {color: '#ffd92f'}, 'Equal sample - yellow (ESA only)', false);
+Map.addLayer(equalPointsGreen, {color: '#1b9e77'}, 'Equal sample - green (both)', false);
 
 // ---------- Diagnostic: what does WorldCover call GMW-only pixels? ----------
 // WorldCover codes: 10 tree, 20 shrub, 30 grass, 40 crop, 50 built-up,
