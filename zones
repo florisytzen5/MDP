@@ -1,0 +1,253 @@
+// =====================================================================
+// GMW v3.0 vs ESA WorldCover 2021 mangroves, plus a multi-epoch
+// persistence gradient for deliberate point picking.
+// Paste into the Earth Engine Code Editor. Run AFTER your "aoi" polygon
+// is already defined (drawn/imported), since this script uses it directly.
+// =====================================================================
+
+// ---------- Settings ----------
+// Area of interest: your existing polygon, named "aoi"
+var AOI = aoi;
+
+Map.addLayer(AOI, {color: 'blue'}, 'AOI', false);
+
+// '1996' = earliest GMW epoch. Run once with '2020' first to measure
+// the purely methodological disagreement (the "noise floor").
+// Valid: 1996, 2007, 2008, 2009, 2010, 2015, 2016, 2017, 2018, 2019, 2020
+var GMW_YEAR = '1996';
+
+var SCALE = 10; // analysis scale (m); WorldCover native resolution
+
+// ---------- GMW v3.0 (awesome-gee-community-catalog) ----------
+var gmwVec = ee.FeatureCollection(
+  'projects/earthengine-legacy/assets/projects/sat-io/open-datasets/GMW/extent/gmw_v3_'
+  + GMW_YEAR + '_vec'
+).filterBounds(AOI);
+
+// Rasterise polygons: 1 = mangrove, 0 = not
+var gmw = ee.Image(0).byte().paint(gmwVec, 1).rename('gmw').clip(AOI);
+
+// ---------- ESA WorldCover 2021 (v200), class 95 = mangroves ----------
+var esa = ee.ImageCollection('ESA/WorldCover/v200').first()
+  .select('Map').eq(95).unmask(0).rename('esa').clip(AOI);
+
+// ---------- Comparison ----------
+// 0 = neither, 1 = GMW only, 2 = ESA only, 3 = both
+var comp = gmw.add(esa.multiply(2)).rename('class');
+
+// ---------- Areas (km²) ----------
+var stats = ee.Image.pixelArea().divide(1e6).addBands(comp).reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'class'}),
+  geometry: AOI,
+  scale: SCALE,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+var areas = ee.Dictionary(ee.List(stats.get('groups')).iterate(function (g, acc) {
+  g = ee.Dictionary(g);
+  return ee.Dictionary(acc).set(ee.Number(g.get('class')).format('%d'), g.get('sum'));
+}, ee.Dictionary({'0': 0, '1': 0, '2': 0, '3': 0})));
+
+var gmwOnly = ee.Number(areas.get('1'));
+var esaOnly = ee.Number(areas.get('2'));
+var both    = ee.Number(areas.get('3'));
+var union   = gmwOnly.add(esaOnly).add(both);
+
+print('GMW ' + GMW_YEAR + ' total (km²)', gmwOnly.add(both));
+print('ESA 2021 total (km²)', esaOnly.add(both));
+print('Both (km²)', both);
+print('GMW ' + GMW_YEAR + ' only (km²)', gmwOnly);
+print('ESA 2021 only (km²)', esaOnly);
+print('Jaccard agreement (both / union)', both.divide(union));
+print('Net difference ESA − GMW (km²)', esaOnly.subtract(gmwOnly));
+
+// ---------- Diagnostic: what does WorldCover call GMW-only pixels? ----------
+// WorldCover codes: 10 tree, 20 shrub, 30 grass, 40 crop, 50 built-up,
+// 60 bare, 80 water, 90 herbaceous wetland, 95 mangrove
+var wcMap = ee.ImageCollection('ESA/WorldCover/v200').first().select('Map');
+var gmwOnlyClasses = ee.Image.pixelArea().divide(1e6)
+  .addBands(wcMap.updateMask(comp.eq(1)))
+  .reduceRegion({
+    reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'wc_class'}),
+    geometry: AOI, scale: SCALE, maxPixels: 1e13
+  });
+print('GMW-only area by WorldCover class (km²)', gmwOnlyClasses.get('groups'));
+
+// ---------- Map ----------
+Map.centerObject(AOI, 12);
+Map.setOptions('SATELLITE');
+Map.addLayer(gmw.selfMask(), {palette: ['#1f78b4']}, 'GMW ' + GMW_YEAR, false);
+Map.addLayer(esa.selfMask(), {palette: ['#33a02c']}, 'ESA WorldCover 2021', false);
+Map.addLayer(comp.updateMask(comp.gt(0)),
+  {min: 1, max: 3, palette: ['#e31a1c', '#ffd92f', '#1b9e77']},
+  'Comparison (red=GMW only, yellow=ESA only, green=both)');
+
+// ---------- Optional export ----------
+Export.image.toDrive({
+  image: comp.byte(),
+  description: 'GMW' + GMW_YEAR + '_vs_ESA2021',
+  region: AOI,
+  scale: SCALE,
+  maxPixels: 1e13
+});
+
+// =====================================================================
+// MULTI-EPOCH PERSISTENCE GRADIENT (for point picking, not comparison)
+// =====================================================================
+// Everything above compares ONE GMW year against ESA WorldCover - useful
+// for checking dataset agreement, but a single year doesn't tell you which
+// areas have been consistently mangrove vs. which have come and gone. This
+// section rasterizes ALL available GMW epochs and sums them, giving each
+// pixel a score from 0-11: how many epochs classified it as mangrove.
+//
+// Note: this GMW asset is structured as separate per-year VECTOR files
+// (unlike the main pipeline script, which uses a single combined
+// ImageCollection) - so building the persistence layer here means looping
+// over every valid year and rasterizing each one individually. This is
+// heavier than the single-year comparison above and may take longer to
+// render.
+var GMW_YEARS = ['1996', '2007', '2008', '2009', '2010', '2015',
+                  '2016', '2017', '2018', '2019', '2020'];
+var nEpochs = GMW_YEARS.length;
+
+var gmwEpochImages = GMW_YEARS.map(function(year) {
+  var vec = ee.FeatureCollection(
+    'projects/earthengine-legacy/assets/projects/sat-io/open-datasets/GMW/extent/gmw_v3_'
+    + year + '_vec'
+  ).filterBounds(AOI);
+  return ee.Image(0).byte().paint(vec, 1).rename('gmw_epoch').clip(AOI);
+});
+
+var persistence = ee.ImageCollection(gmwEpochImages).sum().rename('n_epochs');
+
+Map.addLayer(persistence.selfMask(), {
+  min: 1, max: nEpochs,
+  palette: ['f2d9c4', 'd4b483', '9fbf6a', '3d7a37', '12301f']
+}, 'GMW epochs mapped as mangrove (1-' + nEpochs + ')', false);
+
+// Three named zones for deliberate point picking - see main pipeline
+// script for the full rationale. Sampling only the core would miss the
+// point of having a gradient at all: the fringe is where a regime shift
+// is most likely to actually show up.
+var coreThreshold = nEpochs * 0.8;    // present >=80% of epochs
+var fringeThreshold = nEpochs * 0.3;  // present <=30% of epochs
+
+var zoneCore = persistence.gte(coreThreshold);
+var zoneFringe = persistence.gt(0).and(persistence.lte(fringeThreshold));
+var zoneTransitional = persistence.gt(fringeThreshold).and(persistence.lt(coreThreshold));
+
+Map.addLayer(zoneCore.selfMask(), {palette: ['12301f']}, 'Zone: Core (>=80% epochs)', true, 0.5);
+Map.addLayer(zoneTransitional.selfMask(), {palette: ['d4b483']}, 'Zone: Transitional (30-80%)', true, 0.5);
+Map.addLayer(zoneFringe.selfMask(), {palette: ['a8492a']}, 'Zone: Fringe (<=30% epochs)', true, 0.5);
+
+// Area of each zone - a quick sense of how much each stratum offers
+// before you start clicking points.
+function zoneAreaHa(zoneImage) {
+  var areaDict = zoneImage.selfMask().multiply(ee.Image.pixelArea()).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: AOI,
+    scale: 25,
+    maxPixels: 1e10,
+    tileScale: 4
+  });
+  return ee.Number(areaDict.values().get(0)).divide(1e4);
+}
+
+print('Core zone area (ha):', zoneAreaHa(zoneCore));
+print('Transitional zone area (ha):', zoneAreaHa(zoneTransitional));
+print('Fringe zone area (ha):', zoneAreaHa(zoneFringe));
+
+// =====================================================================
+// LEGENDS
+// =====================================================================
+// GEE has no built-in legend widget - these are built manually from
+// ui.Panel/ui.Label and added to the Map. Placed at the end since a
+// legend only needs the Map object and the colors already defined above,
+// nothing computationally new.
+
+// ---------- Reusable: categorical legend (discrete color -> label pairs) ----------
+function addCategoricalLegend(title, items, position) {
+  var legend = ui.Panel({
+    style: {position: position || 'bottom-left', padding: '8px 15px'}
+  });
+
+  legend.add(ui.Label({
+    value: title,
+    style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 6px 0'}
+  }));
+
+  items.forEach(function(item) {
+    var colorBox = ui.Label({
+      style: {
+        backgroundColor: item.color,
+        padding: '8px',
+        margin: '0 0 4px 0'
+      }
+    });
+    var description = ui.Label({
+      value: item.label,
+      style: {margin: '0 0 4px 6px'}
+    });
+    legend.add(ui.Panel({
+      widgets: [colorBox, description],
+      layout: ui.Panel.Layout.Flow('horizontal')
+    }));
+  });
+
+  Map.add(legend);
+}
+
+// ---------- Reusable: continuous gradient legend (color ramp + min/max) ----------
+function addGradientLegend(title, palette, minVal, maxVal, position) {
+  var legend = ui.Panel({
+    style: {position: position || 'bottom-right', padding: '8px 15px'}
+  });
+
+  legend.add(ui.Label({
+    value: title,
+    style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 6px 0'}
+  }));
+
+  // Render a synthetic left-to-right gradient image as a thumbnail - the
+  // standard GEE trick for a color-ramp legend (there's no direct widget
+  // for this).
+  var lon = ee.Image.pixelLonLat().select('longitude');
+  var gradient = lon.multiply((maxVal - minVal) / 100.0).add(minVal);
+  var legendImage = gradient.visualize({min: minVal, max: maxVal, palette: palette});
+
+  legend.add(ui.Thumbnail({
+    image: legendImage,
+    params: {bbox: [0, 0, 100, 10], dimensions: '150x15'},
+    style: {stretch: 'horizontal', margin: '0 0 4px 0'}
+  }));
+
+  legend.add(ui.Panel({
+    widgets: [
+      ui.Label(String(minVal), {margin: '0 0 0 0'}),
+      ui.Label('', {margin: '0 0 0 0', stretch: 'horizontal'}),
+      ui.Label(String(maxVal), {margin: '0 0 0 0'})
+    ],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  }));
+
+  Map.add(legend);
+}
+
+// ---------- Actual legends for this script's layers ----------
+addCategoricalLegend('GMW vs ESA agreement', [
+  {color: '#e31a1c', label: 'GMW only'},
+  {color: '#ffd92f', label: 'ESA only'},
+  {color: '#1b9e77', label: 'Both'}
+], 'bottom-left');
+
+addCategoricalLegend('Persistence zones', [
+  {color: '#12301f', label: 'Core (>=80% epochs)'},
+  {color: '#d4b483', label: 'Transitional (30-80%)'},
+  {color: '#a8492a', label: 'Fringe (<=30% epochs)'}
+], 'top-left');
+
+// Optional: raw 1-11 gradient, if you want the underlying continuous
+// scale visible alongside the three summary zones above.
+addGradientLegend('Epochs mapped as mangrove',
+  ['f2d9c4', 'd4b483', '9fbf6a', '3d7a37', '12301f'], 1, nEpochs, 'bottom-right');
