@@ -1,0 +1,290 @@
+/*****************************************************************
+ * Mangrove NDVI trends around Sisal, Yucatán — Google Earth Engine
+ *
+ * 1. Landsat 5/7/8/9 annual dry-season NDVI (1985–present),
+ *    cross-sensor harmonised, on a fixed 30 m grid
+ * 2. Per-pixel Sen's slope (NDVI per year) within mangroves
+ * 3. Classification: loss / unchanged / gain
+ * 4. Stratified random sample: N points per class, all points
+ *    at least MIN_DIST_M apart (also across classes)
+ *
+ * Paste into https://code.earthengine.google.com and press Run.
+ * The sampling step can take a minute or two.
+ *****************************************************************/
+
+// ---------------- SETTINGS ----------------
+var aoi = ee.Geometry.Rectangle([-90.12, 21.08, -89.94, 21.22]);
+
+var LS_START_YEAR = 1985;
+var LS_END_YEAR   = 2026;
+var DRY_START_MONTH = 1;          // Jan–May dry-season composites
+var DRY_END_MONTH   = 5;
+
+// Fixed analysis grid: UTM 15N, 30 m (AOI straddles the UTM 15/16 boundary)
+var GRID_30M = ee.Projection('EPSG:32615').atScale(30);
+var MIN_MANGROVE_FRAC = 0.9;      // 30 m cell must be >=90% mangrove
+var MIN_YEARS = 25;               // min. cloud-free years per pixel
+
+// Trend classes, NDVI per YEAR (= the old per-decade thresholds / 10).
+// Keep these small: NDVI only spans ~0–1, so over 40 years a slope of
+// -0.015/yr is already a drop of ~0.6.
+//   Loss:      LOSS_MIN  <= slope <  -T
+//   Unchanged: -T        <= slope <=  T
+//   Gain:      T         <  slope <= GAIN_MAX
+// Pixels outside [LOSS_MIN, GAIN_MAX] are left unclassified.
+// Set LOSS_MIN = -1 and GAIN_MAX = 1 to include the extremes.
+var T = 0.005;
+var LOSS_MIN = -0.015;
+var GAIN_MAX = 0.015;
+
+// Sampling
+var N_PER_CLASS = 33;
+var MIN_DIST_M  = 100;            // minimum distance between ANY two points
+var N_CANDIDATES = 250;           // random candidates per class before thinning
+var SEED = 42;                    // change for a different (reproducible) draw
+
+// ---------------- MANGROVE MASK ----------------
+// ESA WorldCover 2021 (10 m). Static 2021 snapshot -> mangroves lost before
+// 2021 are not included (survivorship bias).
+var wc = ee.ImageCollection('ESA/WorldCover/v200').first().select('Map');
+var mangroveMask = wc.eq(95);
+
+// Fraction of each 30 m cell that is mangrove; keep near-pure cells only
+var mangroveFrac30 = mangroveMask
+  .reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 64})
+  .reproject(GRID_30M);
+var mangroveMask30 = mangroveFrac30.gte(MIN_MANGROVE_FRAC);
+
+function mangroveOnly30(img) {
+  return img.select('NDVI').updateMask(mangroveMask30).rename('Mangrove')
+    .copyProperties(img, ['system:time_start']);
+}
+
+// ---------------- LANDSAT ----------------
+function prepLandsat(img) {
+  // QA_PIXEL bits 1–5: dilated cloud, cirrus, cloud, shadow, snow
+  var mask = img.select('QA_PIXEL').bitwiseAnd(62).eq(0);
+  var sr = img.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  return img.addBands(sr, null, true).updateMask(mask);
+}
+
+// TM/ETM+ -> OLI harmonisation (Roy et al. 2016, OLS coefficients).
+// Derived for ETM+; commonly applied to TM as an approximation.
+function ndviTM(img) {
+  var red = img.select('SR_B3').multiply(0.9047).add(0.0061);
+  var nir = img.select('SR_B4').multiply(0.8462).add(0.0412);
+  return nir.subtract(red).divide(nir.add(red)).rename('NDVI')
+    .copyProperties(img, ['system:time_start']);
+}
+function ndviOLI(img) {
+  return img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')
+    .copyProperties(img, ['system:time_start']);
+}
+
+var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2');
+// L7 only to mid-2013: bridges the L5–L8 gap; later years suffer
+// SLC-off striping and orbital drift.
+var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2').filterDate('1999-01-01', '2013-06-01');
+var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2');
+var l9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2');
+
+var tm  = l5.merge(l7).filterBounds(aoi).map(prepLandsat).map(ndviTM);
+var oli = l8.merge(l9).filterBounds(aoi).map(prepLandsat).map(ndviOLI);
+var landsat = tm.merge(oli);
+
+var annual = ee.ImageCollection.fromImages(
+  ee.List.sequence(LS_START_YEAR, LS_END_YEAR).map(function (y) {
+    var sub = landsat
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .filter(ee.Filter.calendarRange(DRY_START_MONTH, DRY_END_MONTH, 'month'));
+    return sub.median()
+      .reproject(GRID_30M)          // every year on the same 30 m grid
+      .set('system:time_start', ee.Date.fromYMD(y, 3, 1).millis())
+      .set('year', y)
+      .set('n', sub.size());
+  })
+).filter(ee.Filter.gt('n', 0));
+
+print('Landsat years with data:', annual.size());
+
+var chartLS = ui.Chart.image.series({
+  imageCollection: annual.map(mangroveOnly30),
+  region: aoi,
+  reducer: ee.Reducer.mean(),
+  scale: 30
+}).setOptions({
+  title: 'Landsat dry-season mangrove NDVI — Sisal (Jan–May composites)',
+  vAxis: {title: 'NDVI', viewWindow: {min: 0, max: 1}},
+  hAxis: {title: 'Year'},
+  lineWidth: 1.5, pointSize: 4,
+  trendlines: {0: {type: 'linear', lineWidth: 1, opacity: 0.5}}
+});
+print(chartLS);
+
+// ---------------- PER-PIXEL TREND ----------------
+// Sen's slope = median of all pairwise slopes, in NDVI units per YEAR.
+var sensInput = annual.map(function (img) {
+  var year = ee.Image.constant(ee.Number(img.get('year'))).float().rename('year');
+  return year.addBands(img.select('NDVI'));
+});
+var trend = sensInput.reduce(ee.Reducer.sensSlope());  // bands: slope, offset
+var slopePerYear = trend.select('slope').rename('NDVI_per_year');
+
+var nYears = annual.select('NDVI').count().rename('n_years');
+var trendMask = mangroveMask30.and(nYears.gte(MIN_YEARS));
+var slope = slopePerYear.updateMask(trendMask);
+
+// ---------------- CLASSIFICATION ----------------
+// 1 = loss, 2 = gain, 3 = unchanged, 0 = outside the defined ranges (masked)
+var trendClass = slope.multiply(0)
+  .where(slope.gte(LOSS_MIN).and(slope.lt(-T)), 1)
+  .where(slope.gt(T).and(slope.lte(GAIN_MAX)), 2)
+  .where(slope.gte(-T).and(slope.lte(T)), 3)
+  .rename('class').toInt().selfMask();
+
+// Pixel counts per class, plus pixels dropped for being beyond the ranges
+var classCounts = trendClass.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(), geometry: aoi,
+  crs: GRID_30M, maxPixels: 1e9
+}).get('class');
+print('Mangrove pixels per class (1=loss, 2=gain, 3=unchanged):', classCounts);
+
+var beyondRange = slope.lt(LOSS_MIN).or(slope.gt(GAIN_MAX)).selfMask()
+  .reduceRegion({reducer: ee.Reducer.count(), geometry: aoi,
+                 crs: GRID_30M, maxPixels: 1e9});
+print('Pixels beyond [LOSS_MIN, GAIN_MAX], left unclassified:', beyondRange);
+
+print('Mean mangrove NDVI trend (per year):',
+  slope.reduceRegion({reducer: ee.Reducer.mean(), geometry: aoi,
+                      crs: GRID_30M, maxPixels: 1e9}));
+
+// ---------------- SAMPLING ----------------
+// Step 1: random candidate pixels per class (pixel centres on the 30 m grid)
+var candidates = trendClass.addBands(slope).stratifiedSample({
+  numPoints: 0,
+  classBand: 'class',
+  classValues: [1, 2, 3],
+  classPoints: [N_CANDIDATES, N_CANDIDATES, N_CANDIDATES],
+  region: aoi,
+  projection: GRID_30M,
+  seed: SEED,
+  geometries: true,
+  tileScale: 4
+}).randomColumn('rand', SEED).sort('rand');   // shuffle classes together
+
+// Step 2: greedy thinning. Walk through candidates in random order; accept a
+// point if its class still needs points and no accepted point (of ANY class)
+// lies within MIN_DIST_M.
+var init = ee.Dictionary({pts: ee.List([]), c1: 0, c2: 0, c3: 0});
+
+var thinned = ee.Dictionary(candidates.toList(candidates.size()).iterate(
+  function (f, acc) {
+    f = ee.Feature(f);
+    acc = ee.Dictionary(acc);
+    var key = ee.String('c').cat(ee.Number(f.get('class')).int().format());
+    var count = ee.Number(acc.get(key));
+    var pts = ee.List(acc.get('pts'));
+    var nearby = ee.FeatureCollection(pts)
+      .filterBounds(f.geometry().buffer(MIN_DIST_M, 1)).size();
+    var accept = count.lt(N_PER_CLASS).and(nearby.eq(0));
+    return ee.Algorithms.If(accept,
+      acc.set('pts', pts.add(f)).set(key, count.add(1)),
+      acc);
+  }, init));
+
+var classNames = ee.Dictionary({'1': 'loss', '2': 'gain', '3': 'unchanged'});
+var samples = ee.FeatureCollection(ee.List(thinned.get('pts'))).map(function (f) {
+  var c = f.geometry().coordinates();
+  var cls = ee.Number(f.get('class')).int();
+  return f.set({
+    class_name: classNames.get(cls.format()),
+    lon: c.get(0),
+    lat: c.get(1)
+  }).select(['class', 'class_name', 'NDVI_per_year', 'lon', 'lat']);
+});
+
+print('Samples accepted per class (c1=loss, c2=gain, c3=unchanged):',
+  thinned.select(['c1', 'c2', 'c3']));
+print('Sample points:', samples);
+
+// ---------------- MAP ----------------
+Map.centerObject(aoi, 12);
+Map.setOptions('SATELLITE');
+
+var CLASS_COLORS = {1: 'd7191c', 2: '2c7bb6', 3: 'e0e0e0'};
+
+Map.addLayer(mangroveMask.selfMask().clip(aoi), {palette: ['ff00ff']},
+  'WorldCover 2021 mangroves (10 m)', false);
+Map.addLayer(mangroveMask30.selfMask().clip(aoi), {palette: ['00ffff']},
+  'Mangrove mask used for trend (30 m, edges removed)', false);
+
+Map.addLayer(trendClass.clip(aoi),
+  {min: 1, max: 3, palette: [CLASS_COLORS[1], CLASS_COLORS[2], CLASS_COLORS[3]]},
+  'Trend class (loss / gain / unchanged)');
+
+var styledSamples = samples.map(function (f) {
+  var fill = ee.Dictionary({'1': CLASS_COLORS[1], '2': CLASS_COLORS[2], '3': CLASS_COLORS[3]})
+    .get(ee.Number(f.get('class')).int().format());
+  return f.set('style', {color: '000000', fillColor: fill, pointSize: 5, width: 1.5});
+});
+Map.addLayer(styledSamples.style({styleProperty: 'style'}), {}, 'Sample points');
+
+Map.addLayer(ee.Image().paint(aoi, 0, 2), {palette: ['ffff00']}, 'AOI');
+
+// ---------------- LEGEND ----------------
+function makeSwatch(color, name, round) {
+  return ui.Panel([
+    ui.Label('', {
+      backgroundColor: '#' + color, padding: '7px', margin: '2px 6px 2px 8px',
+      border: round ? '1.5px solid black' : '0px'
+    }),
+    ui.Label(name, {fontSize: '12px', margin: '2px 0'})
+  ], ui.Panel.Layout.flow('horizontal'));
+}
+
+var legend = ui.Panel({style: {position: 'bottom-left', width: '290px', padding: '6px'}});
+legend.add(ui.Label('Mangrove NDVI trend, ' + LS_START_YEAR + '–' + LS_END_YEAR,
+  {fontWeight: 'bold', fontSize: '14px', margin: '0 8px 4px 8px'}));
+
+legend.add(makeSwatch(CLASS_COLORS[1], 'Loss: ' + LOSS_MIN + ' to −' + T + ' NDVI / year'));
+legend.add(makeSwatch(CLASS_COLORS[3], 'Unchanged: −' + T + ' to +' + T + ' NDVI / year'));
+legend.add(makeSwatch(CLASS_COLORS[2], 'Gain: +' + T + ' to +' + GAIN_MAX + ' NDVI / year'));
+legend.add(ui.Label('Outlined dots: sample points (' + N_PER_CLASS + ' per class, ≥' +
+  MIN_DIST_M + ' m apart)', {fontSize: '11px', margin: '4px 8px'}));
+legend.add(ui.Label(
+  'Sen\'s slope of Jan–May Landsat composites. 30 m cells ≥' + MIN_MANGROVE_FRAC * 100 +
+  '% mangrove (WorldCover 2021) with ≥' + MIN_YEARS + ' cloud-free years.',
+  {fontSize: '10px', color: '666', margin: '2px 8px 4px 8px'}));
+
+legend.add(makeSwatch('00ffff', 'Mangroves used for trend, 30 m (hidden)'));
+legend.add(makeSwatch('ff00ff', 'Mangroves, 10 m WorldCover (hidden)'));
+legend.add(makeSwatch('ffff00', 'Study area'));
+
+Map.add(legend);
+
+// ---------------- EXPORTS (Tasks tab -> Run) ----------------
+// Sample points: CSV for analysis, KML for phones / Google Earth in the field
+Export.table.toDrive({
+  collection: samples,
+  description: 'Sisal_mangrove_trend_samples_csv',
+  fileFormat: 'CSV'
+});
+Export.table.toDrive({
+  collection: samples,
+  description: 'Sisal_mangrove_trend_samples_kml',
+  fileFormat: 'KML'
+});
+
+// Annual mean mangrove NDVI
+var annualTable = annual.map(mangroveOnly30).map(function (img) {
+  var stats = img.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: aoi, scale: 30, maxPixels: 1e9
+  });
+  return ee.Feature(null, stats)
+    .set('year', ee.Date(img.get('system:time_start')).get('year'));
+});
+Export.table.toDrive({
+  collection: annualTable,
+  description: 'Sisal_annual_dryseason_mangrove_NDVI',
+  fileFormat: 'CSV'
+});
