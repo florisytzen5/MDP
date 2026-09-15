@@ -1,0 +1,155 @@
+//=== AOI =====================================================================
+var AOI = ee.Geometry.Polygon(
+    [[[-90.05041551503234, 21.162924684073946],
+      [-90.09495298591237, 21.158981726153797],
+      [-90.12053053107839, 21.141531063671124],
+      [-90.12018720832448, 21.07859556361946],
+      [-90.05066435065847, 21.07849757664358],
+      [-89.93977110114675, 21.113251544607984],
+      [-89.93925611701589, 21.21314383673432],
+      [-90.00933715735849, 21.174100452704874],
+      [-90.00920841132577, 21.16833774731217],
+      [-90.01991318489279, 21.16485600403262],
+      [-90.0310282590505,  21.162574817466144],
+      [-90.03858135963644, 21.161774392793973],
+      [-90.04819439674581, 21.159733290287747],
+      [-90.05016850258077, 21.16581649311989]]]);
+
+//=== Settings ================================================================
+var DISPLAY  = ee.Geometry.Rectangle([-91.5, 20.0, -86.5, 23.0]);
+var GRIDZONE = AOI.buffer(40000);
+var DATE     = '2023-08-15';
+var ERA5_SST = 'sea_surface_temperature';
+
+var TEMP_MIN = 24, TEMP_MAX = 34;                        // celsius, both layers
+var TEMP_PAL = ['2c7bb6', 'abd9e9', 'ffffbf', 'fdae61', 'd7191c'];
+
+//=== Grid builder (offset = where cell EDGES fall) ===========================
+function gridCells(res, offset, region) {
+  var b  = ee.List(region.bounds().coordinates().get(0));
+  var xs = b.map(function (p) { return ee.List(p).get(0); });
+  var ys = b.map(function (p) { return ee.List(p).get(1); });
+
+  function edges(minV, maxV) {
+    var k0 = ee.Number(minV).subtract(offset).divide(res).floor();
+    var k1 = ee.Number(maxV).subtract(offset).divide(res).ceil();
+    return ee.List.sequence(k0, k1).map(function (k) {
+      return ee.Number(k).multiply(res).add(offset);
+    });
+  }
+
+  var xE = edges(xs.reduce(ee.Reducer.min()), xs.reduce(ee.Reducer.max()));
+  var yE = edges(ys.reduce(ee.Reducer.min()), ys.reduce(ee.Reducer.max()));
+
+  return ee.FeatureCollection(
+    ee.List.sequence(0, xE.size().subtract(2)).map(function (i) {
+      var x0 = ee.Number(xE.get(ee.Number(i)));
+      var x1 = ee.Number(xE.get(ee.Number(i).add(1)));
+      return ee.List.sequence(0, yE.size().subtract(2)).map(function (j) {
+        var y0 = ee.Number(yE.get(ee.Number(j)));
+        var y1 = ee.Number(yE.get(ee.Number(j).add(1)));
+        var g  = ee.Geometry.Rectangle(ee.List([x0, y0, x1, y1]), null, false);
+        return ee.Feature(g, {area_km2: g.area(1).divide(1e6)});
+      });
+    }).flatten()
+  );
+}
+
+var gEra5 = gridCells(0.25, 0.125, GRIDZONE);
+var gLand = gridCells(0.10, 0.05,  GRIDZONE);
+
+//=== Rasters (both converted to celsius) =====================================
+print('ERA5 hourly bands',
+      ee.Image(ee.ImageCollection('ECMWF/ERA5/HOURLY').first()).bandNames());
+
+var era5Sst = ee.ImageCollection('ECMWF/ERA5/HOURLY')
+  .select(ERA5_SST).filterDate(DATE, '2023-08-16').mean().subtract(273.15);
+
+var era5Land = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .select('temperature_2m').filterDate(DATE, '2023-08-16').first()
+  .subtract(273.15);
+
+var VIS = {min: TEMP_MIN, max: TEMP_MAX, palette: TEMP_PAL};
+
+Map.centerObject(DISPLAY, 8);
+Map.addLayer(era5Sst.clip(DISPLAY),  VIS, 'ERA5 sea surface temperature (C)');
+Map.addLayer(era5Land.clip(DISPLAY), VIS, 'ERA5-Land 2m air temperature (C)', false);
+Map.addLayer(ee.Image().byte().paint(gEra5, 0, 2), {palette: ['red']},      'ERA5 0.25 deg');
+Map.addLayer(ee.Image().byte().paint(gLand, 0, 2), {palette: ['orange']},   'ERA5-Land 0.1 deg');
+Map.addLayer(ee.Image().byte().paint(DISPLAY, 0, 2), {palette: ['808080']}, 'Display extent', false);
+Map.addLayer(ee.Image().byte().paint(AOI,   0, 2), {palette: ['#00008B']},  'AOI');
+
+//=== Legend ==================================================================
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px 12px',
+                               backgroundColor: 'white'}});
+legend.add(ui.Label('ERA5 grids',
+                    {fontWeight: 'bold', fontSize: '15px', margin: '0 0 6px 0'}));
+
+function legendRow(color, text) {
+  var lbl = ui.Label(text, {margin: '0 0 4px 0', fontSize: '13px'});
+  legend.add(ui.Panel({
+    widgets: [ui.Label('', {backgroundColor: color, padding: '9px',
+                            margin: '0 8px 4px 0', border: '1px solid #444'}), lbl],
+    layout: ui.Panel.Layout.Flow('horizontal')}));
+  return lbl;
+}
+
+var lblEra5 = legendRow('red',     'ERA5  0.25 deg');
+var lblLand = legendRow('orange',  'ERA5-Land  0.1 deg');
+var lblAOI  = legendRow('#00008B', 'AOI');
+
+function fillArea(lbl, fc, prefix) {
+  ee.Feature(fc.first()).get('area_km2').evaluate(function (v) {
+    lbl.setValue(prefix + '  (' + v.toFixed(0) + ' km2 per cell)');
+  });
+}
+fillArea(lblEra5, gEra5, 'ERA5  0.25 deg');
+fillArea(lblLand, gLand, 'ERA5-Land  0.1 deg');
+AOI.area(1).divide(1e6).evaluate(function (v) {
+  lblAOI.setValue('AOI  (' + v.toFixed(0) + ' km2 total)');
+});
+
+legend.add(ui.Label('Temperature (' + DATE + ')',
+                    {fontWeight: 'bold', fontSize: '13px', margin: '10px 0 0 0'}));
+legend.add(ui.Label('sea surface / 2 m air, same scale',
+                    {fontSize: '11px', color: '555', margin: '0 0 2px 0'}));
+legend.add(ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select('longitude'),
+  params: {bbox: [0, 0, 1, 0.1], dimensions: '180x14',
+           min: 0, max: 1, palette: TEMP_PAL},
+  style: {margin: '2px 0 0 0'}}));
+legend.add(ui.Panel(
+  [ui.Label(TEMP_MIN + ' C', {fontSize: '11px', margin: '0'}),
+   ui.Label(TEMP_MAX + ' C', {fontSize: '11px', margin: '0 0 0 112px'})],
+  ui.Panel.Layout.Flow('horizontal')));
+
+Map.add(legend);
+
+//=== Annual mean ERA5 SST offshore Sisal =====================================
+var BOX   = ee.Geometry.Rectangle([-90.30, 21.30, -89.80, 21.70]);
+var YEARS = ee.List.sequence(1995, 2024);
+
+var era5Daily = ee.ImageCollection('ECMWF/ERA5/HOURLY')
+  .select(ERA5_SST)
+  .filter(ee.Filter.calendarRange(12, 12, 'hour'));
+
+var annualFc = ee.FeatureCollection(YEARS.map(function (year) {
+  year = ee.Number(year);
+  var t0 = ee.Date.fromYMD(year, 1, 1), t1 = t0.advance(1, 'year');
+  var e = era5Daily.filterDate(t0, t1).mean().subtract(273.15)
+            .reduceRegion({reducer: ee.Reducer.mean(), geometry: BOX,
+                           scale: 27830, maxPixels: 1e9}).get(ERA5_SST);
+  return ee.Feature(null, {year: year, ERA5_SST: e});
+}));
+
+print(ui.Chart.feature.byFeature(annualFc, 'year', ['ERA5_SST'])
+  .setChartType('LineChart')
+  .setOptions({title: 'ERA5 annual mean SST offshore Sisal',
+               hAxis: {title: 'Year', format: '####'},
+               vAxis: {title: 'SST (C)'}, lineWidth: 2, pointSize: 3}));
+
+//=== Numbers =================================================================
+print('AOI area (km2)',           AOI.area(1).divide(1e6));
+print('ERA5 cells over AOI',      gEra5.filterBounds(AOI).size());
+print('Mean ERA5 SST in AOI (C)', era5Sst.reduceRegion({
+  reducer: ee.Reducer.mean(), geometry: AOI, scale: 27830, maxPixels: 1e9}));
