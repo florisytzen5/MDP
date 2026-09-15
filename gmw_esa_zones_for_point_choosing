@@ -1,34 +1,53 @@
 /**********************************************************************
- * SISAL — GMW / ESA COMPARISON, PERSISTENCE, TRAJECTORY CLASSIFICATION
+ * SISAL — GMW v4.1 ANNUAL TRAJECTORY CLASSIFICATION
  *
- * Sections:
- *   0  AOI and grid
- *   1  Single-epoch GMW vs ESA WorldCover comparison
- *   2  Persistence gradient, raw and time-weighted (display)
- *   3  Trajectory classification (the sampling frame)
- *   4  Legends
+ * Global Mangrove Watch v4.1.12, 41 annual epochs 1985-2025.
+ * DN 1 = mangrove, DN 0 = non-mangrove.
  *
- * Point selection removed — fix the image first.
+ * Replaces the v3 eleven-epoch version. What changes:
+ *   - No epoch weighting. All intervals are 1 year, so the raw count
+ *     is already unbiased and EPOCH_WEIGHTS is gone.
+ *   - Transition years are exact, not five-year windows.
+ *   - Pre-transition record length becomes computable, which is the
+ *     filter that decides whether a loss pixel is usable as a positive
+ *     case for temporal early-warning analysis at all.
+ *   - flips over 41 observations is a usable noise metric.
  *
- * CHANGES FROM THE PREVIOUS VERSION
- *  - All epoch rasters are pinned to a fixed 25 m UTM grid at creation.
- *    Previously ee.Image(0).paint() carried a default 1-degree EPSG:4326
- *    projection, so focal_min and connectedPixelCount executed at
- *    whatever grid the request happened to use: tile resolution for the
- *    map, scale:25 for the printed table. Rind width and patch filter
- *    therefore differed between what you saw and what the numbers said,
- *    and both changed when you zoomed. Now they don't.
- *  - Persistence is also computed time-weighted. The raw count gives
- *    six of eleven epochs to 2015-2020, which is 55% of the score for
- *    21% of the time span.
- *  - EDGE_BUFFER is a parameter, not a magic number. See the note.
- *  - Class 5 recoloured — the old tan was invisible against bare soil.
+ * Point selection deliberately not included — settle the map first.
  *********************************************************************/
 
 
 /*====================================================================
- * 0. AOI AND GRID
+ * 0. CONFIG
  *===================================================================*/
+
+var GMW_ASSET = 'projects/ee-florisytzen/assets/gmw_v41_sisal';
+
+var FIRST_YEAR = 1985;
+var LAST_YEAR  = 2025;
+
+var PROJ       = 'EPSG:32615';   // UTM 15N
+var GRID_SCALE = 25;             // set from gdalinfo Pixel Size
+
+// How far inside a stable patch a pixel must sit to count as interior.
+// Must exceed the product's boundary uncertainty, not be chosen for
+// looks. Run at 60, 100 and 150 and watch how much interior survives;
+// if it collapses at 150 the AOI has no patches large enough to
+// support a defensible control class, which is a finding.
+var EDGE_BUFFER = 100;           // metres
+
+// Minimum years of record BEFORE a transition for that pixel to be
+// usable as a temporal early-warning case. A rolling window of width w
+// needs at least w observations before the event, plus enough beyond
+// it to see the indicator turn over. 15 is a starting point, not a
+// standard — set it from the window length you actually intend to use.
+var MIN_PRE_YEARS  = 15;
+var MIN_POST_YEARS = 3;
+
+// Isolated single pixels are classification error far more often than
+// real events. Raising this buys cleaner cases and fewer of them, at
+// the cost of genuine small-scale mortality.
+var MIN_PATCH_PIX = 4;           // at 25 m, ~0.25 ha
 
 var aoi = ee.Geometry.Polygon(
   [[[-90.05041551503234, 21.162924684073946],
@@ -45,297 +64,251 @@ var aoi = ee.Geometry.Polygon(
     [-90.03858135963644, 21.161774392793973],
     [-90.04819439674581, 21.159733290287747],
     [-90.05016850258077, 21.165816493119890]]]);
-
 var AOI = aoi;
-
-var PROJ       = 'EPSG:32615';  // UTM 15N
-var GRID_SCALE = 25;            // GMW v3 native resolution
-var ESA_SCALE  = 10;            // WorldCover native resolution
-var GMW_ASSET  = 'projects/earthengine-legacy/assets/projects/sat-io/' +
-                 'open-datasets/GMW/extent/gmw_v3_';
 
 Map.centerObject(AOI, 12);
 Map.setOptions('SATELLITE');
-Map.addLayer(AOI, {color: 'blue'}, 'AOI', false);
-
-// Every epoch raster is pinned to the same grid here, once.
-function epochImage(year) {
-  var vec = ee.FeatureCollection(GMW_ASSET + year + '_vec').filterBounds(AOI);
-  return ee.Image(0).byte().paint(vec, 1)
-    .reproject({crs: PROJ, scale: GRID_SCALE})
-    .rename('gmw_epoch')
-    .clip(AOI);
-}
 
 
 /*====================================================================
- * 1. SINGLE-EPOCH GMW vs ESA WORLDCOVER
- *
- * Run once with GMW_YEAR = '2020' first. WorldCover is 2021, so the
- * 2020 disagreement is close to pure methodological difference — the
- * noise floor any 1996 difference must be judged against.
- *
- * Note GMW v3 is 25 m and WorldCover is 10 m. Upsampling GMW to the
- * 10 m grid does not add information; the comparison is limited by the
- * coarser product regardless of the scale you reduce at.
+ * 1. LOAD AND NORMALISE
+ *===================================================================*/
+var YEARS = [];
+for (var y = FIRST_YEAR; y <= LAST_YEAR; y++) { YEARS.push(y); }
+var nY = YEARS.length;
+
+var bandNames = YEARS.map(function (yr) { return 'y' + yr; });
+var rawBands  = YEARS.map(function (yr, i) { return 'b' + (i + 1); });
+
+var GMW_TILE_A = 'projects/ee-florisytzen/assets/gmw_v41_N22W090';
+var GMW_TILE_B = 'projects/ee-florisytzen/assets/gmw_v41_N22W091';
+
+var tiles = ee.ImageCollection([
+  ee.Image(GMW_TILE_A),
+  ee.Image(GMW_TILE_B)
+]);
+
+var stack = tiles.mosaic()
+  .select(rawBands, bandNames)
+  .unmask(0).gt(0).byte()
+  .reproject({crs: PROJ, scale: GRID_SCALE})
+  .clip(AOI);
+
+print('--- Load check ---');
+print('Tile A bands:', ee.Image(GMW_TILE_A).bandNames());
+print('Tile B bands:', ee.Image(GMW_TILE_B).bandNames());
+print('Years:', nY, FIRST_YEAR + '-' + LAST_YEAR);
+
+/*====================================================================
+ * 2. DERIVED METRICS
  *===================================================================*/
 
-// Valid: 1996, 2007, 2008, 2009, 2010, 2015, 2016, 2017, 2018, 2019, 2020
-var GMW_YEAR = '1996';
+// Persistence: fraction of the 41 years mapped as mangrove.
+// With annual data this needs no weighting.
+var nYears = stack.reduce(ee.Reducer.sum()).rename('n_years');
+var persist = nYears.divide(nY).rename('persist');
 
-var gmw = epochImage(GMW_YEAR).rename('gmw');
+// Turnover. Over 41 annual observations this is a genuine noise
+// metric: real ecological change gives 1-2, speckle gives 10+.
+var flips = ee.Image(0);
+for (var i = 1; i < nY; i++) {
+  flips = flips.add(stack.select(bandNames[i]).neq(stack.select(bandNames[i - 1])));
+}
+flips = flips.rename('flips');
 
-var esa = ee.ImageCollection('ESA/WorldCover/v200').first()
-  .select('Map').eq(95).unmask(0).rename('esa').clip(AOI);
-
-// 0 = neither, 1 = GMW only, 2 = ESA only, 3 = both
-var comp = gmw.add(esa.multiply(2)).rename('class');
-
-var stats = ee.Image.pixelArea().divide(1e6).addBands(comp).reduceRegion({
-  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'class'}),
-  geometry: AOI, scale: ESA_SCALE, crs: PROJ, maxPixels: 1e13, tileScale: 4
+// First and last year present, as calendar years.
+var idxImages = YEARS.map(function (yr, k) {
+  return ee.Image.constant(k).int16()
+    .updateMask(stack.select('y' + yr).eq(1)).rename('idx');
 });
+var firstIdx = ee.ImageCollection(idxImages).min();
+var lastIdx  = ee.ImageCollection(idxImages).max();
+var firstYr = firstIdx.add(FIRST_YEAR).rename('first_year');
+var lastYr  = lastIdx.add(FIRST_YEAR).rename('last_year');
 
-var areas = ee.Dictionary(ee.List(stats.get('groups')).iterate(function (g, acc) {
-  g = ee.Dictionary(g);
-  return ee.Dictionary(acc).set(ee.Number(g.get('class')).format('%d'), g.get('sum'));
-}, ee.Dictionary({'0': 0, '1': 0, '2': 0, '3': 0})));
-
-var gmwOnly = ee.Number(areas.get('1'));
-var esaOnly = ee.Number(areas.get('2'));
-var both    = ee.Number(areas.get('3'));
-var union   = gmwOnly.add(esaOnly).add(both);
-
-print('--- Section 1: single-epoch comparison ---');
-print('GMW ' + GMW_YEAR + ' total (km2)', gmwOnly.add(both));
-print('ESA 2021 total (km2)', esaOnly.add(both));
-print('Both (km2)', both);
-print('GMW ' + GMW_YEAR + ' only (km2)', gmwOnly);
-print('ESA 2021 only (km2)', esaOnly);
-print('Jaccard agreement (both / union)', both.divide(union));
-print('Net difference ESA - GMW (km2)', esaOnly.subtract(gmwOnly));
-
-// If most GMW-only area lands in WorldCover class 90 (herbaceous
-// wetland), the two products are drawing the same boundary in
-// different places rather than disagreeing about mangrove.
-// Codes: 10 tree, 20 shrub, 30 grass, 40 crop, 50 built, 60 bare,
-//        80 water, 90 herbaceous wetland, 95 mangrove
-var wcMap = ee.ImageCollection('ESA/WorldCover/v200').first().select('Map');
-print('GMW-only area by WorldCover class (km2)',
-  ee.Image.pixelArea().divide(1e6)
-    .addBands(wcMap.updateMask(comp.eq(1)))
-    .reduceRegion({
-      reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'wc_class'}),
-      geometry: AOI, scale: ESA_SCALE, crs: PROJ,
-      maxPixels: 1e13, tileScale: 4
-    }).get('groups'));
-
-Map.addLayer(gmw.selfMask(), {palette: ['#1f78b4']}, 'GMW ' + GMW_YEAR, false);
-Map.addLayer(esa.selfMask(), {palette: ['#33a02c']}, 'ESA WorldCover 2021', false);
-Map.addLayer(comp.updateMask(comp.gt(0)),
-  {min: 1, max: 3, palette: ['#e31a1c', '#ffd92f', '#1b9e77']},
-  'Comparison (red=GMW only, yellow=ESA only, green=both)', false);
-
-
-/*====================================================================
- * 2. PERSISTENCE GRADIENT — RAW AND TIME-WEIGHTED
- *
- * GMW v3 epochs exist only where JAXA had an L-band mosaic: JERS-1
- * (1996), ALOS PALSAR (2007-2010), ALOS-2 (2015-2020). The gaps are
- * mission gaps, not processing choices.
- *
- * Raw count consequence: six of eleven epochs sample 2015-2020, so
- * that six-year block carries 55% of the score for 21% of the span.
- * A pixel present only 2015-2020 scores 6; one present 1996 and
- * 2007-2010 scores 5. The count ranks six years of record above
- * fifteen, and an 80% core threshold is unreachable without recent
- * presence — "core" silently means "recently persistent".
- *
- * Weighted fix: each epoch carries the time interval it represents,
- * bounded by midpoints to its neighbours. Sums to the full 24-year
- * span, and drops the 2015-2020 block to 31%.
- *===================================================================*/
-
-var GMW_YEARS = ['1996', '2007', '2008', '2009', '2010', '2015',
-                 '2016', '2017', '2018', '2019', '2020'];
-var nEpochs = GMW_YEARS.length;
-
-// Midpoint interval weights, years. 1996: 1996->2001.5. 2007:
-// 2001.5->2007.5. 2010: 2009.5->2012.5. 2015: 2012.5->2015.5. etc.
-var EPOCH_WEIGHTS = [5.5, 6.0, 1.0, 1.0, 3.0, 3.0, 1.0, 1.0, 1.0, 1.0, 0.5];
-var WEIGHT_TOTAL = 24.0;
-
-var gmwEpochImages = GMW_YEARS.map(epochImage);
-
-// Raw count, 0-11. Kept for reference only.
-var persistence = ee.ImageCollection(gmwEpochImages).sum().rename('n_epochs');
-
-// Time-weighted fraction, 0-1. Use this one.
-var weighted = ee.Image(0);
-for (var w = 0; w < nEpochs; w++) {
-  weighted = weighted.add(gmwEpochImages[w].multiply(EPOCH_WEIGHTS[w]));
-}
-var persistW = weighted.divide(WEIGHT_TOTAL).rename('persist_w');
-
-Map.addLayer(persistence.selfMask(), {
-  min: 1, max: nEpochs,
-  palette: ['f2d9c4', 'd4b483', '9fbf6a', '3d7a37', '12301f']
-}, 'Raw epoch count (1-' + nEpochs + ')', false);
-
-Map.addLayer(persistW.selfMask(), {
-  min: 0.05, max: 1,
-  palette: ['f2d9c4', 'd4b483', '9fbf6a', '3d7a37', '12301f']
-}, 'Time-weighted persistence (0-1)', false);
-
-// Zones from the weighted layer.
-var zoneCore         = persistW.gte(0.8);
-var zoneFringe       = persistW.gt(0).and(persistW.lte(0.3));
-var zoneTransitional = persistW.gt(0.3).and(persistW.lt(0.8));
-
-Map.addLayer(zoneCore.selfMask(),         {palette: ['12301f']}, 'Zone: Core (>=0.8)', false, 0.5);
-Map.addLayer(zoneTransitional.selfMask(), {palette: ['d4b483']}, 'Zone: Transitional (0.3-0.8)', false, 0.5);
-Map.addLayer(zoneFringe.selfMask(),       {palette: ['a8492a']}, 'Zone: Fringe (<=0.3)', false, 0.5);
-
-function zoneAreaHa(zoneImage) {
-  var d = zoneImage.selfMask().multiply(ee.Image.pixelArea()).reduceRegion({
-    reducer: ee.Reducer.sum(), geometry: AOI,
-    scale: GRID_SCALE, crs: PROJ, maxPixels: 1e10, tileScale: 4
-  });
-  return ee.Number(d.values().get(0)).divide(1e4);
-}
-
-print('--- Section 2: persistence zones (time-weighted) ---');
-print('Core zone area (ha):',         zoneAreaHa(zoneCore));
-print('Transitional zone area (ha):', zoneAreaHa(zoneTransitional));
-print('Fringe zone area (ha):',       zoneAreaHa(zoneFringe));
+// Longest unbroken run of mangrove years. Distinguishes 30 consecutive
+// years from 30 scattered ones — identical persistence, entirely
+// different stability.
+var runAcc = ee.Dictionary(ee.List(bandNames).iterate(function (bn, acc) {
+  acc = ee.Dictionary(acc);
+  var cur = ee.Image(acc.get('cur'));
+  var mx  = ee.Image(acc.get('max'));
+  var b   = stack.select(ee.String(bn));
+  var newCur = cur.add(1).multiply(b);   // resets to 0 on a 0 year
+  return ee.Dictionary({cur: newCur, max: mx.max(newCur)});
+}, ee.Dictionary({cur: ee.Image(0), max: ee.Image(0)})));
+var longestRun = ee.Image(runAcc.get('max')).rename('longest_run')
+  .reproject({crs: PROJ, scale: GRID_SCALE});
 
 
 /*====================================================================
  * 3. TRAJECTORY CLASSIFICATION
- *
- * Reads the ordered sequence rather than summing it, so the uneven
- * epoch spacing does not bias it the way the raw count is biased.
- * A persistence score of 5 is produced by loss, by gain, and by pure
- * classification flicker; the sum cannot separate them.
- *
- * Standing caveat: GMW v3's own authors report gain and loss class
- * accuracies of 58% and 60% and recommend against using the
- * independent gain/loss layers. Classes 3 and 4 below inherit that.
  *===================================================================*/
 
-var bandNames = GMW_YEARS.map(function (y) { return 'y' + y; });
-var stack = ee.Image.cat(gmwEpochImages).rename(bandNames);
+var firstEp = stack.select(bandNames[0]);        // 1985
+var lastEp  = stack.select(bandNames[nY - 1]);   // 2025
+var ever    = nYears.gt(0);
+var always  = nYears.eq(nY);
 
-// Turnover: state changes between consecutive epochs.
-// Monotonic change gives 1. Flicker gives 3+.
-var flips = ee.Image(0);
-for (var i = 1; i < nEpochs; i++) {
-  flips = flips.add(
-    stack.select(bandNames[i]).neq(stack.select(bandNames[i - 1])));
-}
-flips = flips.rename('flips');
+// Interior vs edge, among always-mangrove pixels.
+var interior       = always.focal_min({radius: EDGE_BUFFER, units: 'meters'});
+var stableInterior = always.and(interior);
+var stableEdge     = always.and(interior.not());
 
-// First and last epoch present, as calendar years. These are what a
-// temporal early-warning method needs: a transition with a date.
-var idxImages = GMW_YEARS.map(function (y, k) {
-  return ee.Image.constant(k).int8()
-    .updateMask(stack.select('y' + y).eq(1)).rename('idx');
-});
-var seqList  = ee.List.sequence(0, nEpochs - 1);
-var yearList = ee.List(GMW_YEARS.map(function (y) { return parseInt(y, 10); }));
-var firstYear = ee.ImageCollection(idxImages).min()
-  .remap(seqList, yearList).rename('first_year');
-var lastYear  = ee.ImageCollection(idxImages).max()
-  .remap(seqList, yearList).rename('last_year');
+// Single transitions.
+var lossMono = firstEp.eq(1).and(lastEp.eq(0)).and(flips.eq(1));
+var gainMono = firstEp.eq(0).and(lastEp.eq(1)).and(flips.eq(1));
 
-var firstEp = stack.select(bandNames[0]);            // 1996
-var lastEp  = stack.select(bandNames[nEpochs - 1]);  // 2020
-var ever    = persistence.gt(0);
-var stable  = ever.and(flips.eq(0));                 // present every epoch
+// Two transitions — now separable, where 11 epochs collapsed them
+// into one ambiguous bin.
+var lossRecover = firstEp.eq(1).and(lastEp.eq(1)).and(flips.eq(2));
+var gainLoss    = firstEp.eq(0).and(lastEp.eq(0)).and(flips.eq(2));
 
-// EDGE_BUFFER: how far inside a stable patch a pixel must sit to count
-// as interior. NOT a free choice — it has to exceed the boundary
-// uncertainty of the product. GMW v3 reports non-linear misregistration
-// of about +/-1 pixel against the 2010 mosaic, rising to +/-4 pixels
-// (=100 m) for 2019-2020. A buffer below that admits pixels that are
-// "interior" only because two epochs happened to align.
-//
-// Rule: buffer >= worst-case misregistration + half the analysis patch
-// size. At a 100 m patch that is ~150 m.
-//
-// Run at 60, 100 and 150 and watch how much interior survives. If it
-// collapses at 150, the AOI has no patches large enough to support a
-// defensible control class — that is a finding, not a bug.
-var EDGE_BUFFER = 100;   // metres
+var noisy = ever.and(flips.gte(3));
 
-var interior       = stable.focal_min({radius: EDGE_BUFFER, units: 'meters'});
-var stableInterior = stable.and(interior);
-var stableEdge     = stable.and(interior.not());
+// Transition year for single-loss pixels: the first year absent.
+var lossYear = lastYr.add(1).updateMask(lossMono).rename('loss_year');
+var preYears  = lossYear.subtract(FIRST_YEAR).rename('pre_years');
+var postYears = ee.Image.constant(LAST_YEAR).subtract(lossYear).rename('post_years');
 
-var lossMono  = firstEp.eq(1).and(lastEp.eq(0)).and(flips.eq(1));
-var gainMono  = firstEp.eq(0).and(lastEp.eq(1)).and(flips.eq(1));
-var ambiguous = ever.and(flips.gte(2));
+// Loss cases with enough record on both sides of the event to support
+// a rolling-window indicator. This filter is the main thing the annual
+// product makes possible, and it will remove a real share of the
+// apparent loss class.
+var lossUsable = lossMono
+  .and(preYears.gte(MIN_PRE_YEARS))
+  .and(postYears.gte(MIN_POST_YEARS));
+var lossTooEarly = lossMono.and(lossUsable.not());
 
-// 1 stable interior | 2 stable edge | 3 monotonic loss
-// 4 monotonic gain  | 5 ambiguous / high turnover
+// 1 stable interior | 2 stable edge | 3 loss (usable)
+// 4 loss (insufficient record) | 5 gain | 6 loss-then-recovery
+// 7 gain-then-loss | 8 noisy
 var traj = ee.Image(0)
   .where(stableInterior, 1)
   .where(stableEdge, 2)
-  .where(lossMono, 3)
-  .where(gainMono, 4)
-  .where(ambiguous, 5)
+  .where(lossUsable, 3)
+  .where(lossTooEarly, 4)
+  .where(gainMono, 5)
+  .where(lossRecover, 6)
+  .where(gainLoss, 7)
+  .where(noisy, 8)
   .rename('traj').selfMask()
   .reproject({crs: PROJ, scale: GRID_SCALE})
   .clip(AOI);
 
-print('--- Section 3: trajectory classes ---');
-print('EDGE_BUFFER (m):', EDGE_BUFFER);
-print('Area by class (ha) — 1 core, 2 edge, 3 loss, 4 gain, 5 ambiguous:',
-  ee.Image.pixelArea().divide(1e4).addBands(traj).reduceRegion({
-    reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'traj'}),
-    geometry: AOI, scale: GRID_SCALE, crs: PROJ,
-    maxPixels: 1e13, tileScale: 4
-  }).get('groups'));
-
-// Contiguity filter. An isolated loss pixel surrounded by stable
-// mangrove is a classification error far more often than a real event.
-// Raising this buys cleaner cases and fewer of them, at the cost of
-// genuine small-scale mortality. State whichever value you use.
-var MIN_PATCH_PIX = 4;          // at 25 m, ~0.25 ha
 var trajClean = traj.updateMask(
   traj.connectedPixelCount(64, false).gte(MIN_PATCH_PIX));
 
-print('Area by class AFTER contiguity filter (ha):',
-  ee.Image.pixelArea().divide(1e4).addBands(trajClean).reduceRegion({
+
+/*====================================================================
+ * 4. NUMBERS
+ *===================================================================*/
+
+function areaByClass(img, label) {
+  print(label, ee.Image.pixelArea().divide(1e4).addBands(img).reduceRegion({
     reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'traj'}),
     geometry: AOI, scale: GRID_SCALE, crs: PROJ,
     maxPixels: 1e13, tileScale: 4
   }).get('groups'));
+}
 
-// Class 5 recoloured to magenta — the old tan was indistinguishable
-// from bare soil on the satellite basemap, which hid exactly the
-// number that tells you how noisy GMW is over this site.
-Map.addLayer(trajClean, {
-  min: 1, max: 5,
-  palette: ['12301f', '9fbf6a', 'e31a1c', '1f78b4', 'ffd92f']
-}, 'Trajectory class (filtered)', true);
+print('--- Trajectory classes (ha) ---');
+print('1 interior | 2 edge | 3 loss usable | 4 loss too early |',
+      '5 gain | 6 loss-recover | 7 gain-loss | 8 noisy');
+areaByClass(traj,      'Before contiguity filter:');
+areaByClass(trajClean, 'After contiguity filter:');
 
-Map.addLayer(traj, {
-  min: 1, max: 5,
-  palette: ['12301f', '9fbf6a', 'e31a1c', '1f78b4', 'ffd92f']
-}, 'Trajectory class (unfiltered)', false);
+// Compare the two: the gap is single-pixel speckle. If class 3 halves,
+// most of the apparent loss was noise.
 
-// Transition timing. For a class-3 pixel, last_year is the final epoch
-// it was mapped as mangrove; the transition lies between that and the
-// next epoch. Given the 2010-2015 gap, a large share of loss cases are
-// datable only to a five-year window.
-Map.addLayer(lastYear.updateMask(lossMono),
-  {min: 1996, max: 2019, palette: ['fde725', '35b779', '31688e', '440154']},
-  'Loss: last year mapped as mangrove', false);
+// Annual extent. A step change between consecutive years that is large
+// relative to neighbouring years points at a methodology break in the
+// product rather than at the mangrove.
+// One aggregation over all 41 bands instead of 41 separate ones.
+// reduceRegion on a multiband image returns a dictionary keyed by
+// band name, so the per-year loop happens on the dictionary, not on
+// the server.
+var areaDict = ee.Dictionary(
+  stack.multiply(ee.Image.pixelArea()).divide(1e4)
+    .reduceRegion({
+      reducer: ee.Reducer.sum(), geometry: AOI,
+      scale: GRID_SCALE, crs: PROJ, maxPixels: 1e13, tileScale: 4
+    }));
+
+var extentFc = ee.FeatureCollection(
+  ee.List(bandNames).map(function (bn) {
+    var i = ee.List(bandNames).indexOf(bn);
+    return ee.Feature(null, {
+      year: ee.Number(FIRST_YEAR).add(i),
+      area_ha: areaDict.get(bn)
+    });
+  }));
+
+print(ui.Chart.feature.byFeature(extentFc, 'year', ['area_ha'])
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'GMW v4.1 mangrove area within AOI, 1985-2025',
+    hAxis: {title: 'Year', format: '####'},
+    vAxis: {title: 'Hectares'},
+    pointSize: 3, lineWidth: 1
+  }));
+
+// When do losses occur? A flat spread suggests turnover; clusters
+// suggest events worth matching against hurricane or development
+// records.
+print(ui.Chart.image.histogram({
+  image: lossYear.updateMask(lossUsable),
+  region: AOI, scale: GRID_SCALE, maxBuckets: 41
+}).setOptions({
+  title: 'Loss year distribution (usable cases only)',
+  hAxis: {title: 'Year'}, vAxis: {title: 'Pixels'}
+}));
 
 
 /*====================================================================
- * 4. LEGENDS
+ * 5. MAP
+ *===================================================================*/
+
+var trajPalette = [
+  '12301f',  // 1 stable interior
+  '9fbf6a',  // 2 stable edge
+  'e31a1c',  // 3 loss, usable
+  '8c2d04',  // 4 loss, insufficient record
+  '1f78b4',  // 5 gain
+  'ff7f00',  // 6 loss then recovery
+  '6a3d9a',  // 7 gain then loss
+  'e000ff'   // 8 noisy
+];
+
+Map.addLayer(trajClean, {min: 1, max: 8, palette: trajPalette},
+  'Trajectory class (filtered)', true);
+Map.addLayer(traj, {min: 1, max: 8, palette: trajPalette},
+  'Trajectory class (unfiltered)', false);
+
+Map.addLayer(persist.selfMask(), {
+  min: 0.05, max: 1,
+  palette: ['f2d9c4', 'd4b483', '9fbf6a', '3d7a37', '12301f']
+}, 'Persistence (fraction of 41 yr)', false);
+
+Map.addLayer(longestRun.selfMask(), {
+  min: 1, max: nY,
+  palette: ['f2d9c4', 'd4b483', '9fbf6a', '3d7a37', '12301f']
+}, 'Longest unbroken run (yr)', false);
+
+Map.addLayer(flips.updateMask(ever), {
+  min: 0, max: 10, palette: ['ffffff', 'fee08b', 'f46d43', 'a50026']
+}, 'Turnover (state changes)', false);
+
+Map.addLayer(lossYear.updateMask(lossUsable), {
+  min: FIRST_YEAR, max: LAST_YEAR,
+  palette: ['fde725', '5ec962', '21918c', '3b528b', '440154']
+}, 'Loss year (usable cases)', false);
+
+Map.addLayer(ee.Image().paint(AOI, 0, 2), {palette: 'yellow'}, 'AOI', false);
+
+
+/*====================================================================
+ * 6. LEGENDS
  *===================================================================*/
 
 function addCategoricalLegend(title, items, position) {
@@ -359,45 +332,13 @@ function addCategoricalLegend(title, items, position) {
   Map.add(legend);
 }
 
-function addGradientLegend(title, palette, minVal, maxVal, position) {
-  var legend = ui.Panel({
-    style: {position: position || 'bottom-right', padding: '8px 15px'}
-  });
-  legend.add(ui.Label({
-    value: title,
-    style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 6px 0'}
-  }));
-  var lon = ee.Image.pixelLonLat().select('longitude');
-  var gradient = lon.multiply((maxVal - minVal) / 100.0).add(minVal);
-  legend.add(ui.Thumbnail({
-    image: gradient.visualize({min: minVal, max: maxVal, palette: palette}),
-    params: {bbox: [0, 0, 100, 10], dimensions: '150x15'},
-    style: {stretch: 'horizontal', margin: '0 0 4px 0'}
-  }));
-  legend.add(ui.Panel({
-    widgets: [
-      ui.Label(String(minVal)),
-      ui.Label('', {stretch: 'horizontal'}),
-      ui.Label(String(maxVal))
-    ],
-    layout: ui.Panel.Layout.Flow('horizontal')
-  }));
-  Map.add(legend);
-}
-
-addCategoricalLegend('Trajectory class', [
+addCategoricalLegend('Trajectory class (GMW v4.1, 1985-2025)', [
   {color: '#12301f', label: '1 Stable interior (control)'},
   {color: '#9fbf6a', label: '2 Stable edge'},
-  {color: '#e31a1c', label: '3 Monotonic loss'},
-  {color: '#1f78b4', label: '4 Monotonic gain'},
-  {color: '#ffd92f', label: '5 Ambiguous / high turnover'}
+  {color: '#e31a1c', label: '3 Loss — usable case'},
+  {color: '#8c2d04', label: '4 Loss — too little record'},
+  {color: '#1f78b4', label: '5 Gain'},
+  {color: '#ff7f00', label: '6 Loss then recovery'},
+  {color: '#6a3d9a', label: '7 Gain then loss'},
+  {color: '#e000ff', label: '8 Noisy (3+ changes)'}
 ], 'bottom-left');
-
-addCategoricalLegend('GMW vs ESA agreement', [
-  {color: '#e31a1c', label: 'GMW only'},
-  {color: '#ffd92f', label: 'ESA only'},
-  {color: '#1b9e77', label: 'Both'}
-], 'top-right');
-
-addGradientLegend('Time-weighted persistence',
-  ['f2d9c4', 'd4b483', '9fbf6a', '3d7a37', '12301f'], 0, 1, 'bottom-right');
