@@ -1,0 +1,266 @@
+// This code includes ERA5, ERA5-Land and HYCOM datasets
+//=============================================================================
+// SETUP: AOI and grid builder (unchanged from v1)
+//=============================================================================
+var AOI = ee.Geometry.Polygon(
+    [[[-90.05041551503234, 21.162924684073946],
+      [-90.09495298591237, 21.158981726153797],
+      [-90.12053053107839, 21.141531063671124],
+      [-90.12018720832448, 21.07859556361946],
+      [-90.05066435065847, 21.07849757664358],
+      [-89.93977110114675, 21.113251544607984],
+      [-89.93925611701589, 21.21314383673432],
+      [-90.00933715735849, 21.174100452704874],
+      [-90.00920841132577, 21.16833774731217],
+      [-90.01991318489279, 21.16485600403262],
+      [-90.0310282590505,  21.162574817466144],
+      [-90.03858135963644, 21.161774392793973],
+      [-90.04819439674581, 21.159733290287747],
+      [-90.05016850258077, 21.16581649311989]]]);
+
+var GRIDZONE = AOI.buffer(40000);
+
+function gridCells(res, offset, region) {
+  var b  = ee.List(region.bounds().coordinates().get(0));
+  var xs = b.map(function (p) { return ee.List(p).get(0); });
+  var ys = b.map(function (p) { return ee.List(p).get(1); });
+
+  function edges(minV, maxV) {
+    var k0 = ee.Number(minV).subtract(offset).divide(res).floor();
+    var k1 = ee.Number(maxV).subtract(offset).divide(res).ceil();
+    return ee.List.sequence(k0, k1).map(function (k) {
+      return ee.Number(k).multiply(res).add(offset);
+    });
+  }
+
+  var xE = edges(xs.reduce(ee.Reducer.min()), xs.reduce(ee.Reducer.max()));
+  var yE = edges(ys.reduce(ee.Reducer.min()), ys.reduce(ee.Reducer.max()));
+
+  return ee.FeatureCollection(
+    ee.List.sequence(0, xE.size().subtract(2)).map(function (i) {
+      var x0 = ee.Number(xE.get(ee.Number(i)));
+      var x1 = ee.Number(xE.get(ee.Number(i).add(1)));
+      return ee.List.sequence(0, yE.size().subtract(2)).map(function (j) {
+        var y0 = ee.Number(yE.get(ee.Number(j)));
+        var y1 = ee.Number(yE.get(ee.Number(j).add(1)));
+        var g  = ee.Geometry.Rectangle(ee.List([x0, y0, x1, y1]), null, false);
+        return ee.Feature(g, {area_km2: g.area(1).divide(1e6)});
+      });
+    }).flatten()
+  );
+}
+
+var gEra5 = gridCells(0.25, 0.125, GRIDZONE); // ERA5 (non-Land) grid, 0.25 deg
+var gLand = gridCells(0.10, 0.05,  GRIDZONE); // ERA5-Land grid, 0.10 deg
+var gHycom = gridCells(0.08, 0.04,  GRIDZONE);   
+
+//=============================================================================
+// REFERENCE POINTS -- used only to pick out the correct grid cells.
+// Check these visually against the map layers added below and nudge the
+// coordinates if a point does not land in the intended cell.
+//=============================================================================
+var SISAL = ee.Geometry.Point([-90.0303, 21.1619]);
+
+var LAND_PT_1 = ee.Geometry.Point([-90.03, 21.06]);  // inland cell 1, south of Sisal
+var LAND_PT_2 = ee.Geometry.Point([-89.99, 21.06]);  // inland cell 2, south of Sisal
+var SEA_PT    = ee.Geometry.Point([-90.28, 21.22]);  // open water, west of Sisal
+
+var landCell1 = ee.Feature(gLand.filterBounds(LAND_PT_1).first());
+var landCell2 = ee.Feature(gLand.filterBounds(LAND_PT_2).first());
+var seaCell   = ee.Feature(gEra5.filterBounds(SEA_PT).first());
+var HYCOM_PT = ee.Geometry.Point([-90.10, 21.24]);  // pick coordinates inside the desired cyan cell
+var hycomCell = ee.Feature(gHycom.filterBounds(HYCOM_PT).first());
+
+//=============================================================================
+// MAP CHECK
+//=============================================================================
+//=============================================================================
+// HYCOM GRID (0.08 deg native resolution)
+//=============================================================================
+var gHycom = gridCells(0.08, 0.04, GRIDZONE);
+
+//=============================================================================
+// MAP CHECK
+//=============================================================================
+Map.centerObject(AOI, 11);
+Map.addLayer(ee.Image().byte().paint(gLand,  0, 1), {palette: ['orange']}, 'ERA5-Land grid (0.1 deg)');
+Map.addLayer(ee.Image().byte().paint(gEra5,  0, 1), {palette: ['red']},    'ERA5 grid (0.25 deg)');
+Map.addLayer(ee.Image().byte().paint(gHycom, 0, 1), {palette: ['purple']}, 'HYCOM grid (0.08 deg)');
+Map.addLayer(ee.Image().byte().paint(AOI, 0, 2),    {palette: ['#00008B']}, 'AOI');
+Map.addLayer(ee.FeatureCollection([landCell1, landCell2]), {color: 'green'}, 'Selected land cells');
+Map.addLayer(ee.FeatureCollection([seaCell]),              {color: 'blue'},  'Selected sea cell (ERA5)');
+Map.addLayer(HYCOM_PT, {color: 'magenta'}, 'HYCOM point')
+Map.addLayer(ee.FeatureCollection([hycomCell]), {color: 'magenta'}, 'Selected HYCOM cell')
+
+// Highlight the HYCOM cell(s) that fall inside the selected ERA5 sea cell,
+// so you can see how many HYCOM pixels feed into that area average.
+var hycomCellsInSeaCell = gHycom.filterBounds(seaCell.geometry());
+Map.addLayer(hycomCellsInSeaCell, {color: 'cyan'}, 'HYCOM pixels inside sea cell');
+
+Map.addLayer(SISAL,     {color: 'black'}, 'Sisal village');
+Map.addLayer(LAND_PT_1, {color: 'green'}, 'Land point 1');
+Map.addLayer(LAND_PT_2, {color: 'green'}, 'Land point 2');
+Map.addLayer(SEA_PT,    {color: 'blue'},  'Sea point');
+
+//=============================================================================
+// LEGEND
+//=============================================================================
+var legend = ui.Panel({
+  style: {position: 'bottom-left', padding: '8px 12px', backgroundColor: 'white'}
+});
+legend.add(ui.Label('Grids', {fontWeight: 'bold', fontSize: '15px', margin: '0 0 6px 0'}));
+
+function legendRow(color, text) {
+  var lbl = ui.Label(text, {margin: '0 0 4px 0', fontSize: '13px'});
+  legend.add(ui.Panel({
+    widgets: [ui.Label('', {
+      backgroundColor: color, padding: '9px',
+      margin: '0 8px 4px 0', border: '1px solid #444'
+    }), lbl],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  }));
+  return lbl;
+}
+
+function fillArea(lbl, fc, prefix) {
+  ee.Feature(fc.first()).get('area_km2').evaluate(function (v) {
+    lbl.setValue(prefix + '  (' + v.toFixed(1) + ' km2 per cell)');
+  });
+}
+
+var lblLand  = legendRow('orange', 'ERA5-Land  0.1 deg');
+var lblEra5  = legendRow('red',    'ERA5  0.25 deg');
+var lblHycom = legendRow('purple', 'HYCOM  0.08 deg');
+legendRow('#00008B', 'AOI');
+legendRow('green',   'Selected land cells');
+legendRow('blue',    'Selected sea cell (ERA5)');
+legendRow('cyan',    'HYCOM pixels in sea cell');
+
+fillArea(lblLand,  gLand,  'ERA5-Land  0.1 deg');
+fillArea(lblEra5,  gEra5,  'ERA5  0.25 deg');
+fillArea(lblHycom, gHycom, 'HYCOM  0.08 deg');
+
+Map.add(legend);
+
+// Optional: print how many HYCOM pixels fall inside the ERA5 sea cell
+print('Number of HYCOM pixels inside selected sea cell', hycomCellsInSeaCell.size());
+
+//=============================================================================
+// VARIABLES
+//=============================================================================
+var ERA5_LAND_VARS = [
+  'temperature_2m',
+  'total_precipitation_sum',
+  'total_evaporation_sum',
+  'surface_pressure',
+  'u_component_of_wind_10m',
+  'v_component_of_wind_10m'
+];
+
+var ERA5_SST_BAND = 'sea_surface_temperature';
+
+//=============================================================================
+// MONTHLY TIME SERIES
+// Check the HYCOM sea_surface_elevation dataset page for its current end
+// date before setting END_YEAR -- it may lag behind ERA5.
+//=============================================================================
+var START_YEAR = 1995;
+var END_YEAR   = 2024;
+var N_MONTHS   = (END_YEAR - START_YEAR + 1) * 12;
+var t0 = ee.Date.fromYMD(START_YEAR, 1, 1);
+var MONTHS = ee.List.sequence(0, N_MONTHS - 1);
+
+var era5LandMonthly = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR').select(ERA5_LAND_VARS);
+var era5Hourly       = ee.ImageCollection('ECMWF/ERA5/HOURLY').select(ERA5_SST_BAND);
+var hycomSal         = ee.ImageCollection('HYCOM/sea_temp_salinity').select('salinity_0');
+var hycomSSH         = ee.ImageCollection('HYCOM/sea_surface_elevation').select('surface_elevation');
+
+function monthlyStats(m) {
+  var d0 = t0.advance(m, 'month');
+  var d1 = d0.advance(1, 'month');
+  var label = d0.format('YYYY-MM');
+
+  // --- ERA5-Land variables, two inland cells, kept separate -----------------
+  var landImg = era5LandMonthly.filterDate(d0, d1).first();
+  var landStatsC1 = landImg.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: landCell1.geometry(),
+    scale: 1000, maxPixels: 1e9
+  });
+  var landStatsC2 = landImg.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: landCell2.geometry(),
+    scale: 1000, maxPixels: 1e9
+  });
+
+  // --- ERA5 SST, sea cell ----------------------------------------------------
+  var sstImg = era5Hourly.filterDate(d0, d1).mean().subtract(273.15);
+  var sstStats = sstImg.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: seaCell.geometry(),
+    scale: 27830, maxPixels: 1e9
+  });
+
+  // --- HYCOM salinity and sea surface elevation, sea cell --------------------
+// Helper: safely reduce a possibly-empty ImageCollection to a single-band
+// image, returning a fully masked (no-data) image instead of erroring when
+// no images exist for the requested date range.
+function safeMean(collection, bandName) {
+  var hasData = collection.size().gt(0);
+  return ee.Image(ee.Algorithms.If(
+    hasData,
+    collection.mean(),
+    ee.Image().rename(bandName).updateMask(ee.Image(0))
+  ));
+}
+
+// --- HYCOM salinity and sea surface elevation, sea cell --------------------
+var salImg = safeMean(hycomSal.filterDate(d0, d1), 'salinity_0')
+  .multiply(0.001).add(20);
+var salStats = salImg.reduceRegion({
+  reducer: ee.Reducer.mean(), geometry: seaCell.geometry(),
+  scale: 8905.6, maxPixels: 1e9
+});
+
+var sshImg = safeMean(hycomSSH.filterDate(d0, d1), 'surface_elevation')
+  .multiply(0.001);
+var sshStats = sshImg.reduceRegion({
+  reducer: ee.Reducer.mean(), geometry: seaCell.geometry(),
+  scale: 8905.6, maxPixels: 1e9
+});
+
+  return ee.Feature(null, {})
+    .set('date', label)
+    .set('temperature_2m_c1',       landStatsC1.get('temperature_2m'))
+    .set('total_precipitation_c1',  landStatsC1.get('total_precipitation_sum'))
+    .set('total_evaporation_c1',    landStatsC1.get('total_evaporation_sum'))
+    .set('surface_pressure_c1',     landStatsC1.get('surface_pressure'))
+    .set('wind_u_c1',               landStatsC1.get('u_component_of_wind_10m'))
+    .set('wind_v_c1',               landStatsC1.get('v_component_of_wind_10m'))
+    .set('temperature_2m_c2',       landStatsC2.get('temperature_2m'))
+    .set('total_precipitation_c2',  landStatsC2.get('total_precipitation_sum'))
+    .set('total_evaporation_c2',    landStatsC2.get('total_evaporation_sum'))
+    .set('surface_pressure_c2',     landStatsC2.get('surface_pressure'))
+    .set('wind_u_c2',               landStatsC2.get('u_component_of_wind_10m'))
+    .set('wind_v_c2',               landStatsC2.get('v_component_of_wind_10m'))
+    .set('sst_c',                   sstStats.get(ERA5_SST_BAND))
+    .set('salinity_psu',            salStats.get('salinity_0'))
+    .set('sea_surface_elevation_m', sshStats.get('surface_elevation'));
+}
+
+var monthlyFc = ee.FeatureCollection(MONTHS.map(monthlyStats));
+
+//=============================================================================
+// EXPORT
+//=============================================================================
+Export.table.toDrive({
+  collection: monthlyFc,
+  description: 'ERA5_HYCOM_monthly_sisal',
+  folder: 'MDP_Sisal',
+  fileFormat: 'CSV'
+});
+
+//=============================================================================
+// QUICK CHECK
+//=============================================================================
+print('Land cell 1 (feature)', landCell1);
+print('Land cell 2 (feature)', landCell2);
+print('Sea cell (feature)', seaCell);
+print('First 5 rows of monthly time series', monthlyFc.limit(5));
