@@ -58,7 +58,7 @@ var PATCH_DIAGONAL = true;
 // Splits class 1 from class 2 and nothing else. Must exceed GMW's
 // boundary uncertainty (+/-1 pixel typical, +/-4 for recent epochs
 // = 100 m).
-var EDGE_BUFFER = 150;           // metres
+var EDGE_BUFFER = 100;           // metres
 
 // --- Run control -----------------------------------------------------
 var SWEEP       = 'off';   // 'off'|'duration'|'k'|'patch'|'edge'
