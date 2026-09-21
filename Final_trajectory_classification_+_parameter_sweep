@@ -1,21 +1,39 @@
 /**********************************************************************
  * SISAL — GMW v4.1 TRAJECTORY CLASSIFICATION + PARAMETER SWEEPS
+ * Native-grid version with three-band edge scheme.
  *
  * Complete, standalone. Paste into a fresh Code Editor script.
- * Supersedes gmw_v41_trajectory.js, gmw_v41_robust_transitions.js,
- * gmw_v41_merged.js and gmw_v41_sweep.js — do not mix parts of those
- * into this, the class definitions differ between versions.
+ * Supersedes gmw_v41_complete.js for all further work.
+ *
+ * Changes from gmw_v41_complete.js:
+ *  - Runs on the NATIVE grid of the GMW tiles (~30 m). Previously the
+ *    30 m data was nearest-neighbour upsampled to 25 m, which copied
+ *    each GMW pixel into 1-4 cells depending on grid alignment. That
+ *    left temporal results intact but distorted patch pixel counts.
+ *    Now one analysis pixel = one GMW pixel, and pixel areas come from
+ *    the real grid.
+ *  - Three-band edge scheme for stable mangrove:
+ *      class 1  interior    >= EDGE_BUFFER from any boundary
+ *      class 2  edge        <  EDGE_BAND from a boundary
+ *      class 9  transition  in between — mapped, not sampled
+ *    Classes 1-8 keep their numbers. Setting EDGE_BAND = EDGE_BUFFER
+ *    empties class 9 and reproduces the single-buffer scheme.
+ *  - New map layer highlighting the last candidate year's loss cohort,
+ *    for the K=4 vs K=5 check.
+ *  - No robustness mode.
  *
  * Global Mangrove Watch v4.1.12, 41 annual epochs 1985-2025.
  * DN 1 = mangrove, DN 0 = non-mangrove.
  *
- * TEST ORDER — the parameters are nested, so sequence matters:
- *   0  extent chart: are the pre-2018 epochs observed or interpolated?
- *   1  MIN_DURATION   rewrites the stack; everything inherits it
- *   2  K              must exceed MIN_DURATION to do any work
- *   3  MIN_PATCH_PIX  acts last, on the finished classification
- *   4  EDGE_BUFFER    independent; touches classes 1 and 2 only
- *   5  confirmation run with SWEEP = 'off'
+ * RUN ORDER
+ *   1  SWEEP 'off', K=5: compare unfiltered classes 3/7/8 with the old
+ *      25 m numbers (385.6 / 326.6 / 121.6 ha). Within ~5% -> duration
+ *      and K sweeps stand.
+ *   2  K=4 run: inspect the last-candidate-year layer (2022 cohort) in
+ *      historical imagery. Set K.
+ *   3  SWEEP 'patch' — must be redone in native pixels.
+ *   4  SWEEP 'edge' — class 1/2/9 areas for the report.
+ *   5  SWEEP 'off', SHOW_CHARTS true — final numbers and charts.
  *********************************************************************/
 
 
@@ -29,46 +47,42 @@ var GMW_TILE_B = 'projects/ee-florisytzen/assets/gmw_v41_N22W091';
 var FIRST_YEAR = 1985;
 var LAST_YEAR  = 2025;
 
-var PROJ       = 'EPSG:32615';   // UTM 15N
-var GRID_SCALE = 25;
+// --- Parameters ------------------------------------------------------
 
-// --- Parameters under test ------------------------------------------
-
-// A state change only counts if the new state persists this many
-// years. Applied as a centred majority filter of width 2*N-1, so runs
-// shorter than N are outvoted. Clean step edges are preserved exactly;
-// ambiguous edges move by at most N-1 years. 1 disables the filter.
+// Years a new state must persist to count. Centred majority filter of
+// width 2N-1. 1 disables the filter.
 var MIN_DURATION = 3;
 
-// Years required present before / absent after a transition for it to
-// qualify. Symmetric, so a 1995 loss faces the same test as a 2020
-// one. Costs K years at each end of the record as candidate years.
-// MUST exceed MIN_DURATION: after a duration filter of N every
-// surviving run is already >= N years, so K <= N adds nothing.
+// Years stable before / after a transition. Must exceed MIN_DURATION.
+// Set to 4 for the step-2 check of the 2022 loss cohort.
 var K = 5;
 
-// Minimum connected patch size, in pixels of the same class.
-var MIN_PATCH_PIX = 8;
+// Minimum connected patch, in NATIVE pixels (~0.09 ha each; exact
+// value printed in the load check). PROVISIONAL until the patch sweep
+// is rerun on this grid — 6 native pixels ~ the old 0.5 ha choice.
+var MIN_PATCH_PIX = 6;
 
-// Diagonal linking in connectedPixelCount. false = 4-connectivity.
-// The Sisal fringe runs diagonally in places, where 4-connectivity
-// fragments a thin strip into many size-1 patches. Worth testing.
+// 8-connectivity: diagonal neighbours count as connected.
 var PATCH_DIAGONAL = true;
 
-// Splits class 1 from class 2 and nothing else. Must exceed GMW's
-// boundary uncertainty (+/-1 pixel typical, +/-4 for recent epochs
-// = 100 m).
-var EDGE_BUFFER = 100;           // metres
+// Edge scheme, metres. On a ~30 m grid:
+//   EDGE_BAND   50 m  = any non-stable pixel in the 3x3 neighbourhood,
+//                       i.e. the pixels touching a boundary
+//   EDGE_BUFFER 100 m = at least ~3 pixels from any boundary
+// On a geographic grid GEE converts metres to pixels at the nominal
+// scale, so kernels are ~6% narrower east-west at 21 N. Negligible.
+var EDGE_BUFFER = 100;
+var EDGE_BAND   = 75;
 
 // --- Run control -----------------------------------------------------
 var SWEEP       = 'off';   // 'off'|'duration'|'k'|'patch'|'edge'
-var SHOW_CHARTS = true;    // set false while sweeping — saves time
+var SHOW_CHARTS = true;    // false while sweeping
 var SHOW_MAP    = true;
 
 var DUR_VALUES   = [1, 2, 3, 4, 5];
 var K_VALUES     = [4, 5, 6, 7, 8];
-var PATCH_VALUES = [1, 2, 4, 8, 16, 32];
-var EDGE_VALUES  = [60, 100, 150, 200];
+var PATCH_VALUES = [1, 2, 3, 4, 6, 8, 12, 16];   // native pixels
+var EDGE_VALUES  = [50, 75, 100, 150];
 
 var AOI = ee.Geometry.Polygon(
   [[[-90.05041551503234, 21.162924684073946],
@@ -79,7 +93,7 @@ var AOI = ee.Geometry.Polygon(
     [-89.93977110114675, 21.113251544607984],
     [-89.93925611701589, 21.213143836734320],
     [-90.00933715735849, 21.174100452704874],
-    [-90.02163012765293, 21.17150261406858],
+    [-90.00920841132577, 21.168337747312170],
     [-90.01991318489279, 21.164856004032620],
     [-90.03102825905050, 21.162574817466144],
     [-90.03858135963644, 21.161774392793973],
@@ -91,8 +105,24 @@ Map.setOptions('SATELLITE');
 
 
 /*====================================================================
- * 1. LOAD
+ * 1. NATIVE GRID AND LOAD
  *===================================================================*/
+
+// The tiles' own projection. Adjacent 1-degree tiles from the same
+// product share one grid, so reprojecting the mosaic onto tile A's
+// grid reads every pixel exactly, with no resampling.
+var NATIVE      = ee.Image(GMW_TILE_A).projection();
+var NATIVE_INFO = NATIVE.getInfo();
+var GRID        = {crs: NATIVE_INFO.crs, crsTransform: NATIVE_INFO.transform};
+
+// Every regional reduction runs on the native grid through this helper.
+function rr(img, reducer) {
+  return img.reduceRegion({
+    reducer: reducer, geometry: AOI,
+    crs: GRID.crs, crsTransform: GRID.crsTransform,
+    maxPixels: 1e13, tileScale: 4
+  });
+}
 
 var YEARS = [];
 for (var y = FIRST_YEAR; y <= LAST_YEAR; y++) { YEARS.push(y); }
@@ -101,28 +131,35 @@ var nY = YEARS.length;
 var bandNames = YEARS.map(function (yr) { return 'y' + yr; });
 var rawBands  = YEARS.map(function (yr, i) { return 'b' + (i + 1); });
 
-// unmask(0) guards 0-ingested-as-nodata; gt(0) guards 0/255 encoding.
-// The reproject pins focal_min and connectedPixelCount to a fixed
-// grid — without it they run at request resolution, so the rind width
-// and patch filter change with zoom and disagree with the areas.
 var stackRaw = ee.ImageCollection([ee.Image(GMW_TILE_A), ee.Image(GMW_TILE_B)])
   .mosaic()
   .select(rawBands, bandNames)
   .unmask(0).gt(0).byte()
-  .reproject({crs: PROJ, scale: GRID_SCALE})
+  .reproject(GRID)
   .clip(AOI);
+
+// Mean true pixel area over the AOI, in hectares.
+var PIXEL_HA = ee.Number(rr(ee.Image.pixelArea(), ee.Reducer.mean()).get('area'))
+  .divide(1e4);
 
 print('--- Load check ---');
 print('Tile A bands:', ee.Image(GMW_TILE_A).bandNames());
 print('Tile B bands:', ee.Image(GMW_TILE_B).bandNames());
 // Both must list 41 bands in identical order. The AOI crosses -90, so
-// mosaic() draws from a different tile either side of that line; a
-// mismatch would give different years per half with nothing flagging it.
+// mosaic() draws from a different tile either side of that line.
+print('Native CRS:', NATIVE_INFO.crs);
+print('Tile A transform:', NATIVE_INFO.transform);
+print('Tile B transform:', ee.Image(GMW_TILE_B).projection().getInfo().transform);
+// Pixel size (1st and 5th entries) must match between tiles.
+print('Nominal scale (m):', NATIVE.nominalScale());
+print('Mean pixel area over AOI (ha):', PIXEL_HA);
 
 
 /*====================================================================
  * 2. SHARED FUNCTIONS
  *===================================================================*/
+
+var CLASS_KEYS = ['1','2','3','4','5','6','7','8','9'];
 
 function temporalMajority(img, names, halfWidth) {
   var out = [];
@@ -133,8 +170,7 @@ function temporalMajority(img, names, halfWidth) {
     out.push(img.select(win).reduce(ee.Reducer.sum())
       .gt(win.length / 2).rename(names[i]));
   }
-  return ee.Image.cat(out).byte()
-    .reproject({crs: PROJ, scale: GRID_SCALE});
+  return ee.Image.cat(out).byte().reproject(GRID);
 }
 
 function countFlips(img) {
@@ -145,27 +181,26 @@ function countFlips(img) {
   return f.rename('flips');
 }
 
-// Class areas as a dictionary keyed '1'..'8', hectares, 1 decimal.
+// Class areas as a dictionary keyed '1'..'9', hectares, 1 decimal.
 function classAreas(img) {
-  var groups = ee.List(ee.Image.pixelArea().divide(1e4).addBands(img)
-    .reduceRegion({
-      reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'traj'}),
-      geometry: AOI, scale: GRID_SCALE, crs: PROJ,
-      maxPixels: 1e13, tileScale: 4
-    }).get('groups'));
-
+  var groups = ee.List(rr(
+    ee.Image.pixelArea().divide(1e4).addBands(img),
+    ee.Reducer.sum().group({groupField: 1, groupName: 'traj'})
+  ).get('groups'));
+  var init = {};
+  CLASS_KEYS.forEach(function (k) { init[k] = 0; });
   return ee.Dictionary(groups.iterate(function (g, acc) {
     g = ee.Dictionary(g);
     return ee.Dictionary(acc)
       .set(ee.Number(g.get('traj')).format('%d'),
            ee.Number(g.get('sum')).multiply(10).round().divide(10));
-  }, ee.Dictionary({'1':0,'2':0,'3':0,'4':0,'5':0,'6':0,'7':0,'8':0})));
+  }, ee.Dictionary(init)));
 }
 
 /**
- * Full pipeline as a function of the four parameters.
- * Returns the unfiltered and patch-filtered classifications plus the
- * intermediate layers, so a sweep can read raw or filtered.
+ * Full pipeline as a function of the swept parameters.
+ * Returns unfiltered and patch-filtered classifications plus the
+ * layers the charts need.
  */
 function buildTraj(minDuration, kWin, minPatch, edgeBuf) {
   var s = (minDuration > 1)
@@ -178,8 +213,8 @@ function buildTraj(minDuration, kWin, minPatch, edgeBuf) {
   var always = nYrs.eq(nY);
   var firstE = s.select(bandNames[0]);
 
-  // Year-invariant transitions, plus the per-year event and at-risk
-  // bands the hazard chart needs.
+  // Year-invariant transitions: K years in the old state immediately
+  // before, K in the new state immediately after. Same test every year.
   var lossC = ee.Image(0), gainC = ee.Image(0);
   var lossYearU = ee.Image(0), gainYearU = ee.Image(0);
   var candYears = [], eventBands = [], riskBands = [];
@@ -187,45 +222,41 @@ function buildTraj(minDuration, kWin, minPatch, edgeBuf) {
   for (var t = kWin; t <= nY - kWin; t++) {
     var yr = YEARS[t];
     candYears.push(yr);
-
     var preOn   = s.select(bandNames.slice(t - kWin, t)).reduce(ee.Reducer.sum()).eq(kWin);
     var postOff = s.select(bandNames.slice(t, t + kWin)).reduce(ee.Reducer.sum()).eq(0);
     var preOff  = s.select(bandNames.slice(t - kWin, t)).reduce(ee.Reducer.sum()).eq(0);
     var postOn  = s.select(bandNames.slice(t, t + kWin)).reduce(ee.Reducer.sum()).eq(kWin);
-
     var lossHit = preOn.and(postOff);
     var gainHit = preOff.and(postOn);
-
     lossC = lossC.add(lossHit);
     gainC = gainC.add(gainHit);
     lossYearU = lossYearU.where(lossHit.and(lossYearU.eq(0)), yr);
     gainYearU = gainYearU.where(gainHit.and(gainYearU.eq(0)), yr);
-
     eventBands.push(lossHit.rename('e' + yr));
     riskBands.push(preOn.rename('r' + yr));   // eligible to transition at t
   }
 
-  var inter = always.focal_min({radius: edgeBuf, units: 'meters'});
-  var one = f.eq(1), two = f.eq(2);
+  // Three-band edge scheme. 'Interior at distance d' = every pixel
+  // within d is also stable mangrove.
+  var interBuf  = always.focal_min({radius: edgeBuf,   units: 'meters'});
+  var interBand = always.focal_min({radius: EDGE_BAND, units: 'meters'});
 
+  var one = f.eq(1), two = f.eq(2);
   var lossSingle = one.and(firstE.eq(1)).and(lossC.gte(1));
   var gainSingle = one.and(firstE.eq(0)).and(gainC.gte(1));
   var lossRecov  = two.and(firstE.eq(1)).and(lossC.gte(1)).and(gainC.gte(1));
   var gainLoss   = two.and(firstE.eq(0)).and(gainC.gte(1)).and(lossC.gte(1));
 
-  // Changed, but no transition passes the K test: the change sits
-  // within K years of a record end, or the new state is too brief.
+  // Changed, but no transition passes the K test: within K years of a
+  // record end, or the new state lasted >= MIN_DURATION but < K years.
   var unqual = ever.and(f.gte(1)).and(f.lte(2))
     .and(lossSingle.or(gainSingle).or(lossRecov).or(gainLoss).not());
 
-  // Partitioned on turnover count, so classes are mutually exclusive:
-  //   flips 0  -> 1 interior / 2 edge
-  //   flips 1  -> 3 loss / 4 gain if it passes K, else 7
-  //   flips 2  -> 5 loss-recover / 6 gain-loss if both pass, else 7
-  //   flips 3+ -> 8 noisy
+  // Partitioned on turnover count, so classes are mutually exclusive.
   var tj = ee.Image(0)
-    .where(always.and(inter), 1)
-    .where(always.and(inter.not()), 2)
+    .where(always.and(interBuf), 1)                          // interior
+    .where(always.and(interBand.not()), 2)                   // edge
+    .where(always.and(interBand).and(interBuf.not()), 9)     // transition band
     .where(lossSingle, 3)
     .where(gainSingle, 4)
     .where(lossRecov, 5)
@@ -233,7 +264,7 @@ function buildTraj(minDuration, kWin, minPatch, edgeBuf) {
     .where(unqual, 7)
     .where(ever.and(f.gte(3)), 8)
     .rename('traj').selfMask()
-    .reproject({crs: PROJ, scale: GRID_SCALE}).clip(AOI);
+    .reproject(GRID).clip(AOI);
 
   var tjClean = tj.updateMask(
     tj.connectedPixelCount(64, PATCH_DIAGONAL).gte(minPatch));
@@ -241,19 +272,28 @@ function buildTraj(minDuration, kWin, minPatch, edgeBuf) {
   return {
     stack: s, flips: f, ever: ever, nYears: nYrs,
     traj: tj, clean: tjClean,
-    lossYear: lossYearU.selfMask().rename('loss_year')
-      .reproject({crs: PROJ, scale: GRID_SCALE}),
-    gainYear: gainYearU.selfMask().rename('gain_year')
-      .reproject({crs: PROJ, scale: GRID_SCALE}),
+    lossYear: lossYearU.selfMask().rename('loss_year').reproject(GRID),
+    gainYear: gainYearU.selfMask().rename('gain_year').reproject(GRID),
     candYears: candYears, eventBands: eventBands, riskBands: riskBands
   };
 }
 
 function meanFlips(r) {
-  return ee.Number(r.flips.updateMask(r.ever).reduceRegion({
-    reducer: ee.Reducer.mean(), geometry: AOI,
-    scale: GRID_SCALE, crs: PROJ, maxPixels: 1e13, tileScale: 4
-  }).values().get(0)).multiply(100).round().divide(100);
+  return ee.Number(rr(r.flips.updateMask(r.ever), ee.Reducer.mean())
+    .values().get(0)).multiply(100).round().divide(100);
+}
+
+// Hazard per candidate year: events / pixels at risk. Two aggregations.
+function hazardFc(r) {
+  var eD = ee.Dictionary(rr(ee.Image.cat(r.eventBands), ee.Reducer.sum()));
+  var rD = ee.Dictionary(rr(ee.Image.cat(r.riskBands),  ee.Reducer.sum()));
+  return ee.FeatureCollection(r.candYears.map(function (yr) {
+    var e = ee.Number(eD.get('e' + yr));
+    var q = ee.Number(rD.get('r' + yr));
+    return ee.Feature(null, {
+      year: yr, events: e, at_risk: q, hazard: e.divide(q.max(1))
+    });
+  }));
 }
 
 
@@ -269,11 +309,10 @@ var flipsRaw  = countFlips(stackRaw);
 var traj      = R.traj;
 var trajClean = R.clean;
 var candYears = R.candYears;
+var lastCand  = candYears[candYears.length - 1];
 
 var persist = R.nYears.divide(nY).rename('persist');
 
-// Longest unbroken run. Separates 30 consecutive mangrove years from
-// 30 scattered ones — identical persistence, different stability.
 var runAcc = ee.Dictionary(ee.List(bandNames).iterate(function (bn, acc) {
   acc = ee.Dictionary(acc);
   var cur = ee.Image(acc.get('cur'));
@@ -282,34 +321,38 @@ var runAcc = ee.Dictionary(ee.List(bandNames).iterate(function (bn, acc) {
   return ee.Dictionary({cur: newCur, max: mx.max(newCur)});
 }, ee.Dictionary({cur: ee.Image(0), max: ee.Image(0)})));
 var longestRun = ee.Image(runAcc.get('max')).rename('longest_run')
-  .reproject({crs: PROJ, scale: GRID_SCALE});
+  .reproject(GRID);
 
 print('--- Settings ---');
 print('MIN_DURATION:', MIN_DURATION,
       ' majority window (yr):', 2 * MIN_DURATION - 1);
-print('K:', K, ' candidate years:',
-      candYears[0] + '-' + candYears[candYears.length - 1]);
-print('MIN_PATCH_PIX:', MIN_PATCH_PIX,
-      ' (' + (MIN_PATCH_PIX * GRID_SCALE * GRID_SCALE / 10000) + ' ha)',
+print('K:', K, ' candidate years:', candYears[0] + '-' + lastCand);
+print('MIN_PATCH_PIX:', MIN_PATCH_PIX, ' native pixels =',
+      PIXEL_HA.multiply(MIN_PATCH_PIX).multiply(100).round().divide(100), 'ha',
       ' diagonal:', PATCH_DIAGONAL);
-print('EDGE_BUFFER (m):', EDGE_BUFFER);
+print('Interior >= ' + EDGE_BUFFER + ' m | edge < ' + EDGE_BAND +
+      ' m | transition band ' + EDGE_BAND + '-' + EDGE_BUFFER + ' m');
 
 print('Mean turnover before / after duration filter:',
-  ee.Image.cat([flipsRaw.rename('before'), flips.rename('after')])
-    .updateMask(stackRaw.reduce(ee.Reducer.sum()).gt(0))
-    .reduceRegion({
-      reducer: ee.Reducer.mean(), geometry: AOI,
-      scale: GRID_SCALE, crs: PROJ, maxPixels: 1e13, tileScale: 4
-    }));
+  rr(ee.Image.cat([flipsRaw.rename('before'), flips.rename('after')])
+       .updateMask(stackRaw.reduce(ee.Reducer.sum()).gt(0)),
+     ee.Reducer.mean()));
 
 print('--- Trajectory classes (ha) ---');
 print('1 interior | 2 edge | 3 loss | 4 gain | 5 loss-recover |',
-      '6 gain-loss | 7 fails K | 8 noisy');
+      '6 gain-loss | 7 fails K | 8 noisy | 9 transition band');
+// Report AREAS and RATES from the unfiltered table — the patch filter
+// preferentially removes small patches, so filtered totals understate
+// loss. Draw SAMPLE POINTS from the filtered layer.
 print('Before contiguity filter:', classAreas(traj));
 print('After contiguity filter:',  classAreas(trajClean));
-// The gap between these two is single-pixel speckle. Percent removed
-// per class is the MIN_PATCH_PIX measurement; it does not show up on
-// the map.
+
+// Size of the last candidate year's loss cohort. At K=4 this is 2022,
+// the cohort that decides between K=4 and K=5.
+print('Loss in last candidate year (' + lastCand + '), unfiltered (ha):',
+  ee.Number(rr(R.lossYear.eq(lastCand).selfMask()
+                 .multiply(ee.Image.pixelArea()).divide(1e4),
+               ee.Reducer.sum()).values().get(0)));
 
 
 /*====================================================================
@@ -318,18 +361,12 @@ print('After contiguity filter:',  classAreas(trajClean));
 
 if (SHOW_CHARTS) {
 
-  // One aggregation over all 41 bands. Looping reduceRegion per year
-  // trips GEE's concurrency limit.
   var areaDict = ee.Dictionary(
-    stack.multiply(ee.Image.pixelArea()).divide(1e4).reduceRegion({
-      reducer: ee.Reducer.sum(), geometry: AOI,
-      scale: GRID_SCALE, crs: PROJ, maxPixels: 1e13, tileScale: 4
-    }));
+    rr(stack.multiply(ee.Image.pixelArea()).divide(1e4), ee.Reducer.sum()));
 
-  // STEP 0 CHECK. Flat plateaus with jumps at 1990/1995/2000/2005/
-  // 2010/2015 mean the pre-2018 annual epochs are interpolated, not
-  // observed — in which case there are not 41 independent
-  // observations and every sweep below is tuning filler.
+  // Flat plateaus with jumps at 1990/1995/2000/2005/2010/2015 would
+  // mean intermediate years are largely copied between baselines
+  // rather than independently observed.
   print(ui.Chart.feature.byFeature(
     ee.FeatureCollection(ee.List(bandNames).map(function (bn) {
       var i = ee.List(bandNames).indexOf(bn);
@@ -345,27 +382,8 @@ if (SHOW_CHARTS) {
       pointSize: 3, lineWidth: 1
     }));
 
-  // Hazard: events / pixels still at risk. Handles right-censoring and
-  // the shrinking denominator together. A flat loss COUNT against a
-  // shrinking extent is a rising RATE, which a histogram cannot show.
-  var eDict = ee.Dictionary(ee.Image.cat(R.eventBands).reduceRegion({
-    reducer: ee.Reducer.sum(), geometry: AOI,
-    scale: GRID_SCALE, crs: PROJ, maxPixels: 1e13, tileScale: 4
-  }));
-  var rDict = ee.Dictionary(ee.Image.cat(R.riskBands).reduceRegion({
-    reducer: ee.Reducer.sum(), geometry: AOI,
-    scale: GRID_SCALE, crs: PROJ, maxPixels: 1e13, tileScale: 4
-  }));
+  var hazFc = hazardFc(R);
 
-  var hazFc = ee.FeatureCollection(candYears.map(function (yr) {
-    var e = ee.Number(eDict.get('e' + yr));
-    var r = ee.Number(rDict.get('r' + yr));
-    return ee.Feature(null, {
-      year: yr, events: e, at_risk: r, hazard: e.divide(r.max(1))
-    });
-  }));
-
-  // Kaplan-Meier survival: the running product of (1 - hazard).
   var survList = ee.List(hazFc.aggregate_array('hazard')
     .iterate(function (h, acc) {
       acc = ee.List(acc);
@@ -420,19 +438,25 @@ var trajPalette = [
   'ff7f00',  // 5 loss then recovery
   '6a3d9a',  // 6 gain then loss
   '999999',  // 7 changed, fails K test
-  'e000ff'   // 8 noisy
+  'e000ff',  // 8 noisy
+  '4f7942'   // 9 transition band (not sampled)
 ];
 
 if (SHOW_MAP) {
-  Map.addLayer(trajClean, {min: 1, max: 8, palette: trajPalette},
-    'Trajectory class (filtered)', true);
-  Map.addLayer(traj, {min: 1, max: 8, palette: trajPalette},
-    'Trajectory class (unfiltered)', false);
+  Map.addLayer(trajClean, {min: 1, max: 9, palette: trajPalette},
+    'Trajectory class (filtered — sample from this)', true);
+  Map.addLayer(traj, {min: 1, max: 9, palette: trajPalette},
+    'Trajectory class (unfiltered — report areas from this)', false);
 
   Map.addLayer(R.lossYear, {
-    min: candYears[0], max: candYears[candYears.length - 1],
+    min: candYears[0], max: lastCand,
     palette: ['fde725', '5ec962', '21918c', '3b528b', '440154']
   }, 'Loss year', false);
+
+  // Step-2 check. At K=4 this is the 2022 cohort. Bright yellow so the
+  // clusters are easy to find, then inspect them in historical imagery.
+  Map.addLayer(R.lossYear.eq(lastCand).selfMask(), {palette: ['ffff00']},
+    'Loss in last candidate year (' + lastCand + ')', false);
 
   Map.addLayer(persist.selfMask(), {
     min: 0.05, max: 1,
@@ -461,13 +485,14 @@ if (SHOW_MAP) {
     style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 6px 0'}
   }));
   [{color: '#12301f', label: '1 Stable interior (control)'},
-   {color: '#9fbf6a', label: '2 Stable edge'},
+   {color: '#9fbf6a', label: '2 Stable edge (< ' + EDGE_BAND + ' m)'},
+   {color: '#4f7942', label: '9 Transition band (not sampled)'},
    {color: '#e31a1c', label: '3 Loss'},
    {color: '#1f78b4', label: '4 Gain'},
    {color: '#ff7f00', label: '5 Loss then recovery'},
    {color: '#6a3d9a', label: '6 Gain then loss'},
    {color: '#999999', label: '7 Changed, fails K test'},
-   {color: '#e000ff', label: '8 Noisy (3+ changes)'}
+   {color: '#e000ff', label: '8 Noisy (3+ changes)'},
   ].forEach(function (item) {
     legend.add(ui.Panel({
       widgets: [
@@ -485,25 +510,16 @@ if (SHOW_MAP) {
 /*====================================================================
  * 6. PARAMETER SWEEPS
  *
- * Set SWEEP above and SHOW_CHARTS = false. Run ONE at a time — each
- * value rebuilds the full 41-band pipeline.
+ * Set SWEEP and SHOW_CHARTS = false. One at a time — each value
+ * rebuilds the full 41-band pipeline.
  *===================================================================*/
 
-// --- STEP 1: MIN_DURATION -------------------------------------------
-// Hold MIN_PATCH_PIX at 1. Spatial and temporal filtering remove
-// overlapping pixels, so measuring the duration effect after spatial
-// filtering understates it. Judge on class_ha_raw.
-//
-// Expect turnover to fall steeply from 1 to ~3, then flatten. The
-// steep part is noise removal; the flat part means real short-lived
-// states are being deleted.
-//
-// Bounded below at 3 by ecology: mangrove does not die and regrow in
-// two years. Bounded above by the same logic — Isidore (2002) and
-// Wilma (2005) hit this coast, and a dieback with 3-4 year recovery is
-// erased at 5. High is not "safe".
+// --- MIN_DURATION ----------------------------------------------------
+// Only rerun if the step-1 confirmation differs from the old 25 m
+// numbers by more than ~5%. Patch held at 1 so spatial filtering does
+// not mask the temporal effect. Judge on class_ha_raw.
 if (SWEEP === 'duration') {
-  print('=== STEP 1: MIN_DURATION sweep (K=' + K + ', patch=1) ===');
+  print('=== MIN_DURATION sweep (K=' + K + ', patch=1) ===');
   DUR_VALUES.forEach(function (d) {
     var r = buildTraj(d, K, 1, EDGE_BUFFER);
     print('MIN_DURATION = ' + d, ee.Dictionary({
@@ -511,22 +527,13 @@ if (SWEEP === 'duration') {
       class_ha_raw:  classAreas(r.traj)
     }));
   });
-  print('Read: mean_turnover, then class 8 (noisy) and class 3 (loss).');
-  print('If class 8 stays large at d=5, the instability is not');
-  print('single-year speckle but erratic classification — a GMW');
-  print('quality finding about this site, worth reporting.');
 }
 
-// --- STEP 2: K -------------------------------------------------------
-// K must EXCEED MIN_DURATION. After a duration filter of N every
-// surviving run is already >= N years, so K <= N is satisfied
-// automatically and adds no information.
-//
-// Class 3 shrinks as K rises, class 7 grows. Plot class 3 against K
-// and take the knee. Stop raising K once class 7 approaches class 3 in
-// size — at that point the test discards as many events as it keeps.
+// --- K ---------------------------------------------------------------
+// Only rerun if the duration sweep was rerun and moved. K must exceed
+// MIN_DURATION; smaller values are skipped.
 if (SWEEP === 'k') {
-  print('=== STEP 2: K sweep (MIN_DURATION=' + MIN_DURATION + ', patch=1) ===');
+  print('=== K sweep (MIN_DURATION=' + MIN_DURATION + ', patch=1) ===');
   K_VALUES.forEach(function (k) {
     if (k <= MIN_DURATION) {
       print('K = ' + k + ' skipped: not greater than MIN_DURATION');
@@ -539,20 +546,15 @@ if (SWEEP === 'k') {
   });
 }
 
-// --- STEP 3: MIN_PATCH_PIX -------------------------------------------
-// Percent removed is the measurement, and it needs the unfiltered
-// baseline. Steep drop then plateau = speckle. Slow linear decline =
-// genuinely contiguous patches. Set the threshold at the elbow.
-//
-// Then convert surviving class 3 to sampling units: hectares / 1 ha at
-// a 100 m patch. Under ~25 units and the filter, not the data, is what
-// limits the sample.
-//
-// Also flip PATCH_DIAGONAL and re-run. The fringe runs diagonally in
-// places, where 4-connectivity fragments a thin strip into size-1
-// patches — that may matter more than the threshold.
+// --- MIN_PATCH_PIX ---------------------------------------------------
+// Must be redone on this grid: values are now native GMW pixels.
+// Percent removed per class is the measurement. Steep drop then
+// plateau = speckle; slow steady decline = contiguous patches.
+// Choose where the noisy class is largely removed without gutting
+// class 3.
 if (SWEEP === 'patch') {
-  print('=== STEP 3: MIN_PATCH_PIX sweep (diagonal=' + PATCH_DIAGONAL + ') ===');
+  print('=== MIN_PATCH_PIX sweep (native pixels, diagonal=' +
+        PATCH_DIAGONAL + ', K=' + K + ') ===');
   var base = buildTraj(MIN_DURATION, K, 1, EDGE_BUFFER);
   var baseArea = classAreas(base.traj);
   print('Unfiltered baseline (ha):', baseArea);
@@ -561,42 +563,31 @@ if (SWEEP === 'patch') {
     var filt = base.traj.updateMask(
       base.traj.connectedPixelCount(64, PATCH_DIAGONAL).gte(p));
     var a = classAreas(filt);
-    var pct = ee.Dictionary(ee.List(['1','2','3','4','5','6','7','8'])
-      .iterate(function (kk, acc) {
-        kk = ee.String(kk);
-        var b0 = ee.Number(baseArea.get(kk));
-        var a0 = ee.Number(a.get(kk));
-        return ee.Dictionary(acc).set(kk, ee.Algorithms.If(
-          b0.gt(0),
-          ee.Number(1).subtract(a0.divide(b0)).multiply(1000).round().divide(10),
-          -1));                                  // -1 = class empty
-      }, ee.Dictionary({})));
-    print('MIN_PATCH_PIX = ' + p + '  (' +
-          (p * GRID_SCALE * GRID_SCALE / 10000) + ' ha)',
-      ee.Dictionary({pct_removed: pct, remaining_ha: a}));
+    var pct = ee.Dictionary(ee.List(CLASS_KEYS).iterate(function (kk, acc) {
+      kk = ee.String(kk);
+      var b0 = ee.Number(baseArea.get(kk));
+      var a0 = ee.Number(a.get(kk));
+      return ee.Dictionary(acc).set(kk, ee.Algorithms.If(
+        b0.gt(0),
+        ee.Number(1).subtract(a0.divide(b0)).multiply(1000).round().divide(10),
+        -1));                                    // -1 = class empty
+    }, ee.Dictionary({})));
+    print('MIN_PATCH_PIX = ' + p, ee.Dictionary({
+      min_patch_ha: PIXEL_HA.multiply(p).multiply(100).round().divide(100),
+      pct_removed:  pct,
+      remaining_ha: a
+    }));
   });
-  print('connectedPixelCount caps at 64 — values above that need the');
-  print('maxSize argument raised.');
 }
 
-// --- STEP 4: EDGE_BUFFER ---------------------------------------------
-// Independent of the other three; affects classes 1 and 2 only, so its
-// position in the sequence is arbitrary. Record the numbers rather
-// than eyeballing rind thickness.
-//
-// Insensitivity here means patches are large relative to the buffer,
-// not that the parameter is harmless. Whether the control class is
-// actually contaminated is a question for the NDVI series, not this
-// layer.
+// --- EDGE_BUFFER -----------------------------------------------------
+// Interior threshold varied with EDGE_BAND fixed. Affects classes 1, 2
+// and 9 only. One run gives the areas for the report.
 if (SWEEP === 'edge') {
-  print('=== STEP 4: EDGE_BUFFER sweep ===');
+  print('=== EDGE_BUFFER sweep (EDGE_BAND=' + EDGE_BAND + ' m) ===');
   EDGE_VALUES.forEach(function (b) {
     var r = buildTraj(MIN_DURATION, K, MIN_PATCH_PIX, b);
-    print('EDGE_BUFFER = ' + b + ' m', classAreas(r.clean));
+    print('EDGE_BUFFER = ' + b + ' m  (read classes 1, 2, 9)',
+          classAreas(r.clean));
   });
 }
-
-// --- STEP 5 ----------------------------------------------------------
-// Set all four parameters to their chosen values, SWEEP = 'off',
-// SHOW_CHARTS = true, and run once. Report those numbers alongside the
-// ranges tested.
