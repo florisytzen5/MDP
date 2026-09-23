@@ -66,7 +66,7 @@ var MIN_PATCH_PIX = 6;
 var PATCH_DIAGONAL = true;
 
 // Edge scheme, metres. On a ~30 m grid:
-//   EDGE_BAND   50 m  = any non-stable pixel in the 3x3 neighbourhood,
+//   EDGE_BAND   75 m  = any non-stable pixel in the 3x3 neighbourhood,
 //                       i.e. the pixels touching a boundary
 //   EDGE_BUFFER 100 m = at least ~3 pixels from any boundary
 // On a geographic grid GEE converts metres to pixels at the nominal
@@ -103,6 +103,8 @@ var AOI = ee.Geometry.Polygon(
 Map.centerObject(AOI, 12);
 Map.setOptions('SATELLITE');
 
+// 500 m exceeds the largest edge buffer (150 m) and a 16-pixel chain (~480 m).
+var PROC = AOI.buffer(500);
 
 /*====================================================================
  * 1. NATIVE GRID AND LOAD
@@ -136,7 +138,7 @@ var stackRaw = ee.ImageCollection([ee.Image(GMW_TILE_A), ee.Image(GMW_TILE_B)])
   .select(rawBands, bandNames)
   .unmask(0).gt(0).byte()
   .reproject(GRID)
-  .clip(AOI);
+  .clip(PROC);
 
 // Mean true pixel area over the AOI, in hectares.
 var PIXEL_HA = ee.Number(rr(ee.Image.pixelArea(), ee.Reducer.mean()).get('area'))
@@ -154,12 +156,19 @@ print('Tile B transform:', ee.Image(GMW_TILE_B).projection().getInfo().transform
 print('Nominal scale (m):', NATIVE.nominalScale());
 print('Mean pixel area over AOI (ha):', PIXEL_HA);
 
+var rawMos = ee.ImageCollection([ee.Image(GMW_TILE_A), ee.Image(GMW_TILE_B)])
+  .mosaic().select(rawBands, bandNames);
+var everRaw = stackRaw.reduce(ee.Reducer.sum()).gt(0);
 
+print('Masked pixels per year inside ever-mangrove area:',
+  rr(rawMos.mask().lt(1).updateMask(everRaw), ee.Reducer.sum()));
+print('Unmasked zeros per year inside ever-mangrove area:',
+  rr(rawMos.eq(0).updateMask(everRaw), ee.Reducer.sum()));
 /*====================================================================
  * 2. SHARED FUNCTIONS
  *===================================================================*/
 
-var CLASS_KEYS = ['1','2','3','4','5','6','7','8','9'];
+var CLASS_KEYS = ['1','2','3','4','5','6','7','8','9','10'];
 
 function temporalMajority(img, names, halfWidth) {
   var out = [];
@@ -254,24 +263,29 @@ function buildTraj(minDuration, kWin, minPatch, edgeBuf) {
 
   // Partitioned on turnover count, so classes are mutually exclusive.
   var tj = ee.Image(0)
-    .where(always.and(interBuf), 1)                          // interior
-    .where(always.and(interBand.not()), 2)                   // edge
-    .where(always.and(interBand).and(interBuf.not()), 9)     // transition band
+    .where(always.and(interBuf), 1)
+    .where(always.and(interBand.not()), 2)
+    .where(always.and(interBand).and(interBuf.not()), 9)
     .where(lossSingle, 3)
     .where(gainSingle, 4)
     .where(lossRecov, 5)
     .where(gainLoss, 6)
     .where(unqual, 7)
+    .where(unqual.and(lossC.gte(1)), 10)   // qualifying loss, second transition unverified
     .where(ever.and(f.gte(3)), 8)
     .rename('traj').selfMask()
-    .reproject(GRID).clip(AOI);
+    .reproject(GRID);
 
   var tjClean = tj.updateMask(
     tj.connectedPixelCount(64, PATCH_DIAGONAL).gte(minPatch));
 
+  tj      = tj.clip(AOI);
+  tjClean = tjClean.clip(AOI);
+  
   return {
     stack: s, flips: f, ever: ever, nYears: nYrs,
     traj: tj, clean: tjClean,
+    lossC: lossC, gainC: gainC,
     lossYear: lossYearU.selfMask().rename('loss_year').reproject(GRID),
     gainYear: gainYearU.selfMask().rename('gain_year').reproject(GRID),
     candYears: candYears, eventBands: eventBands, riskBands: riskBands
@@ -346,6 +360,13 @@ print('1 interior | 2 edge | 3 loss | 4 gain | 5 loss-recover |',
 // loss. Draw SAMPLE POINTS from the filtered layer.
 print('Before contiguity filter:', classAreas(traj));
 print('After contiguity filter:',  classAreas(trajClean));
+
+var c7 = traj.eq(7).selfMask();
+print('Class 7 composition, unfiltered (ha):', rr(ee.Image.cat([
+    c7.rename('all'),
+    c7.updateMask(R.lossC.gte(1)).rename('qualifying_loss'),
+    c7.updateMask(R.gainC.gte(1)).rename('qualifying_gain')
+  ]).multiply(ee.Image.pixelArea()).divide(1e4), ee.Reducer.sum()));
 
 // Size of the last candidate year's loss cohort. At K=4 this is 2022,
 // the cohort that decides between K=4 and K=5.
@@ -439,13 +460,14 @@ var trajPalette = [
   '6a3d9a',  // 6 gain then loss
   '999999',  // 7 changed, fails K test
   'e000ff',  // 8 noisy
-  '4f7942'   // 9 transition band (not sampled)
+  '4f7942',  // 9 transition band (not sampled)
+  'b15928',  // 10 loss, 2nd change unverified  
 ];
 
 if (SHOW_MAP) {
-  Map.addLayer(trajClean, {min: 1, max: 9, palette: trajPalette},
+  Map.addLayer(trajClean, {min: 1, max: 10, palette: trajPalette},
     'Trajectory class (filtered — sample from this)', true);
-  Map.addLayer(traj, {min: 1, max: 9, palette: trajPalette},
+  Map.addLayer(traj, {min: 1, max: 10, palette: trajPalette},
     'Trajectory class (unfiltered — report areas from this)', false);
 
   Map.addLayer(R.lossYear, {
@@ -493,6 +515,7 @@ if (SHOW_MAP) {
    {color: '#6a3d9a', label: '6 Gain then loss'},
    {color: '#999999', label: '7 Changed, fails K test'},
    {color: '#e000ff', label: '8 Noisy (3+ changes)'},
+   {color: '#b15928', label: '10 Loss, 2nd change unverified'},
   ].forEach(function (item) {
     legend.add(ui.Panel({
       widgets: [
