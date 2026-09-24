@@ -1,0 +1,616 @@
+/**********************************************************************
+ * SISAL — SAMPLE POINT SELECTOR v2
+ *
+ * Draws the fixed reference set of sample points for the NDVI / EWS
+ * analysis from the GMW v4.1 trajectory classification. The
+ * classification code is a copy of the parameter-sweep script at its
+ * final parameters; the consistency check must reproduce the sweep
+ * script's "After contiguity filter" table exactly.
+ *
+ * Changes from the simple version:
+ *   - Reserve points per class (RESERVE), exported with reserve = 1.
+ *   - Spacing set per class (MIN_SEP_PIX is a dictionary).
+ *   - Metadata CSV with the seed and every parameter.
+ *   - Core-pixel rule per class (CORE_ONLY).
+ *   - Cap on loss points per loss year (MAX_PER_LOSS_YEAR).
+ *
+ * Points are drawn from the FILTERED trajectory layer, one point = one
+ * native GMW pixel (exported as its centre).
+ *   1   stable interior
+ *   2   stable edge
+ *   3   loss
+ *   4   gain
+ *   5   loss then recovery
+ *   10  loss, 2nd change unverified -> exported as traj 3, traj_src 10
+ *
+ * CSV columns
+ *   point_id   c<class>_<nnn>, e.g. c3_017, c10_004. Ranks above
+ *              N_POINTS are reserves (c3_031 = first class 3 reserve).
+ *   traj       1 2 3 4 5 (class 10 exported as 3)
+ *   traj_src   class before merging (3 or 10 for loss points)
+ *   loss_year  first year in the non-mangrove state, 0 = none
+ *   gain_year  first year in the mangrove state, 0 = none
+ *   reserve    0 = main sample, 1 = reserve
+ *   lon, lat   pixel centre, EPSG:4326
+ *
+ * WORKFLOW
+ *   1  Run. Check the consistency table, the eligible-area table, the
+ *      loss-year histogram, requested vs achieved and the map.
+ *   2  Adjust N_POINTS, RESERVE, MIN_SEP_PIX, CORE_ONLY and
+ *      MAX_PER_LOSS_YEAR if needed, rerun.
+ *   3  Run both exports in the Tasks tab. Upload the points CSV as a
+ *      table asset (X column = lon, Y column = lat) and reuse it in
+ *      every NDVI run. Analyse reserve = 0; replace rejected points by
+ *      the lowest-ranked unused reserve of the same class.
+ *   4  Rerun only to change the sampling design deliberately.
+ *********************************************************************/
+
+
+/*====================================================================
+ * 0. CONFIG
+ *===================================================================*/
+
+var GMW_TILE_A = 'projects/ee-florisytzen/assets/gmw_v41_N22W090';
+var GMW_TILE_B = 'projects/ee-florisytzen/assets/gmw_v41_N22W091';
+
+var FIRST_YEAR = 1985;
+var LAST_YEAR  = 2025;
+
+// --- Classification: must equal the sweep script ---------------------
+var MIN_DURATION   = 3;
+var K              = 5;
+var MIN_PATCH_PIX  = 6;
+var PATCH_DIAGONAL = true;
+var EDGE_BUFFER    = 100;
+var EDGE_BAND      = 75;
+
+// --- Sampling ---------------------------------------------------------
+
+// Starting value of the random generator. Same seed + same data + same
+// settings = identical points. Recorded in the metadata export.
+var SEED = 42;
+
+// Main points per class. Class 10 points come on top of class 3 and are
+// exported as traj 3.
+var N_POINTS = {1: 30, 2: 30, 3: 30, 4: 30, 5: 30, 10: 10};
+
+// Reserve points per class, ranked after the main points.
+var RESERVE  = {1: 5, 2: 5, 3: 15, 4: 5, 5: 10, 10: 5};
+
+// Minimum spacing per class, in native pixels, square block: no other
+// point of the same class within +/- this many rows AND columns.
+// 1 = 3x3 block excluded, 3 = 7x7, 8 = 17x17. Classes 3 and 10 are one
+// spacing group; each candidate is checked with its own class's value,
+// so keep 3 and 10 equal.
+var MIN_SEP_PIX = {1: 3, 2: 3, 3: 3, 4: 3, 5: 3, 10: 3};
+
+// Core-pixel rule per class. true = a pixel is eligible only if all 8
+// neighbours belong to the same group:
+//   loss classes 3, 5, 10 -> neighbours are loss pixels (any loss year)
+//   gain class 4          -> neighbours are class 4 pixels (any year)
+//   stable classes 1, 2   -> neighbours are stable mangrove (1, 2, 9)
+// Class 1 is core by construction; class 2 would be emptied (edge
+// pixels touch a boundary); class 10 has too few pixels.
+// if elligible area per class removes too much change to false
+var CORE_ONLY = {1: false, 2: false, 3: false, 4: false, 5: false, 10: false};
+
+// Maximum loss points (classes 3, 5 and 10 together, main + reserve)
+// with the same loss year. 0 = no cap. Set from the loss-year
+// histogram; raise OVERSAMPLE if the cap causes shortfalls.
+var MAX_PER_LOSS_YEAR = 10;
+
+// Candidates drawn per class = (N_POINTS + RESERVE) x OVERSAMPLE. Raise
+// if a class falls short while more eligible pixels are available.
+var OVERSAMPLE = 5;
+
+var CLASS_COLORS = {
+  1: '#12301f', 2: '#9fbf6a', 3: '#e31a1c', 4: '#1f78b4', 5: '#ff7f00'
+};
+
+var EXPORT_FOLDER = 'GEE_exports_sampling';
+var EXPORT_NAME   = 'Sisal_sample_points';
+
+var AOI = ee.Geometry.Polygon(
+  [[[-90.05041551503234, 21.162924684073946],
+    [-90.09495298591237, 21.158981726153797],
+    [-90.12053053107839, 21.141531063671124],
+    [-90.12018720832448, 21.078595563619460],
+    [-90.05066435065847, 21.078497576643580],
+    [-89.93977110114675, 21.113251544607984],
+    [-89.93925611701589, 21.213143836734320],
+    [-90.00933715735849, 21.174100452704874],
+    [-90.02163012765293, 21.17150261406858],
+    [-90.01991318489279, 21.164856004032620],
+    [-90.03102825905050, 21.162574817466144],
+    [-90.03858135963644, 21.161774392793973],
+    [-90.04819439674581, 21.159733290287747],
+    [-90.05016850258077, 21.165816493119890]]]);
+
+var PROC = AOI.buffer(500);
+
+var SAMPLE_CLASSES = [1, 2, 3, 4, 5, 10];
+var LOSS_CLASSES   = [3, 5, 10];
+
+Map.centerObject(AOI, 12);
+Map.setOptions('SATELLITE');
+
+
+/*====================================================================
+ * 1. NATIVE GRID AND LOAD  (as in the sweep script)
+ *===================================================================*/
+
+var NATIVE      = ee.Image(GMW_TILE_A).projection();
+var NATIVE_INFO = NATIVE.getInfo();
+var GRID        = {crs: NATIVE_INFO.crs, crsTransform: NATIVE_INFO.transform};
+
+// Grid geometry for row / column indices.
+var T  = NATIVE_INFO.transform;   // [xScale, xShear, xOffset, yShear, yScale, yOffset]
+var DX = T[0], X0 = T[2], DY = T[4], Y0 = T[5];
+
+function rr(img, reducer) {
+  return img.reduceRegion({
+    reducer: reducer, geometry: AOI,
+    crs: GRID.crs, crsTransform: GRID.crsTransform,
+    maxPixels: 1e13, tileScale: 4
+  });
+}
+
+var YEARS = [];
+for (var y = FIRST_YEAR; y <= LAST_YEAR; y++) { YEARS.push(y); }
+var nY = YEARS.length;
+
+var bandNames = YEARS.map(function (yr) { return 'y' + yr; });
+var rawBands  = YEARS.map(function (yr, i) { return 'b' + (i + 1); });
+
+var stackRaw = ee.ImageCollection([ee.Image(GMW_TILE_A), ee.Image(GMW_TILE_B)])
+  .mosaic()
+  .select(rawBands, bandNames)
+  .unmask(0).gt(0).byte()
+  .reproject(GRID)
+  .clip(PROC);
+
+
+/*====================================================================
+ * 2. CLASSIFICATION  (copy of the sweep script, final parameters)
+ *===================================================================*/
+
+var CLASS_KEYS = ['1','2','3','4','5','6','7','8','9','10'];
+
+function temporalMajority(img, names, halfWidth) {
+  var out = [];
+  for (var i = 0; i < names.length; i++) {
+    var lo = Math.max(0, i - halfWidth);
+    var hi = Math.min(names.length - 1, i + halfWidth);
+    var win = names.slice(lo, hi + 1);
+    out.push(img.select(win).reduce(ee.Reducer.sum())
+      .gt(win.length / 2).rename(names[i]));
+  }
+  return ee.Image.cat(out).byte().reproject(GRID);
+}
+
+function countFlips(img) {
+  var f = ee.Image(0);
+  for (var i = 1; i < nY; i++) {
+    f = f.add(img.select(bandNames[i]).neq(img.select(bandNames[i - 1])));
+  }
+  return f.rename('flips');
+}
+
+// Class areas keyed '1'..'10', hectares, 1 decimal.
+function classAreas(img) {
+  var groups = ee.List(rr(
+    ee.Image.pixelArea().divide(1e4).addBands(img),
+    ee.Reducer.sum().group({groupField: 1, groupName: 'traj'})
+  ).get('groups'));
+  var init = {};
+  CLASS_KEYS.forEach(function (k) { init[k] = 0; });
+  return ee.Dictionary(groups.iterate(function (g, acc) {
+    g = ee.Dictionary(g);
+    return ee.Dictionary(acc)
+      .set(ee.Number(g.get('traj')).format('%d'),
+           ee.Number(g.get('sum')).multiply(10).round().divide(10));
+  }, ee.Dictionary(init)));
+}
+
+function buildTraj(minDuration, kWin, minPatch, edgeBuf) {
+  var s = (minDuration > 1)
+    ? temporalMajority(stackRaw, bandNames, minDuration - 1)
+    : stackRaw;
+
+  var f      = countFlips(s);
+  var nYrs   = s.reduce(ee.Reducer.sum()).rename('n_years');
+  var ever   = nYrs.gt(0);
+  var always = nYrs.eq(nY);
+  var firstE = s.select(bandNames[0]);
+
+  var lossC = ee.Image(0), gainC = ee.Image(0);
+  var lossYearU = ee.Image(0), gainYearU = ee.Image(0);
+
+  for (var t = kWin; t <= nY - kWin; t++) {
+    var yr = YEARS[t];
+    var preOn   = s.select(bandNames.slice(t - kWin, t)).reduce(ee.Reducer.sum()).eq(kWin);
+    var postOff = s.select(bandNames.slice(t, t + kWin)).reduce(ee.Reducer.sum()).eq(0);
+    var preOff  = s.select(bandNames.slice(t - kWin, t)).reduce(ee.Reducer.sum()).eq(0);
+    var postOn  = s.select(bandNames.slice(t, t + kWin)).reduce(ee.Reducer.sum()).eq(kWin);
+    var lossHit = preOn.and(postOff);
+    var gainHit = preOff.and(postOn);
+    lossC = lossC.add(lossHit);
+    gainC = gainC.add(gainHit);
+    lossYearU = lossYearU.where(lossHit.and(lossYearU.eq(0)), yr);
+    gainYearU = gainYearU.where(gainHit.and(gainYearU.eq(0)), yr);
+  }
+
+  var interBuf  = always.focal_min({radius: edgeBuf,   units: 'meters'});
+  var interBand = always.focal_min({radius: EDGE_BAND, units: 'meters'});
+
+  var one = f.eq(1), two = f.eq(2);
+  var lossSingle = one.and(firstE.eq(1)).and(lossC.gte(1));
+  var gainSingle = one.and(firstE.eq(0)).and(gainC.gte(1));
+  var lossRecov  = two.and(firstE.eq(1)).and(lossC.gte(1)).and(gainC.gte(1));
+  var gainLoss   = two.and(firstE.eq(0)).and(gainC.gte(1)).and(lossC.gte(1));
+
+  var unqual = ever.and(f.gte(1)).and(f.lte(2))
+    .and(lossSingle.or(gainSingle).or(lossRecov).or(gainLoss).not());
+
+  var tj = ee.Image(0)
+    .where(always.and(interBuf), 1)
+    .where(always.and(interBand.not()), 2)
+    .where(always.and(interBand).and(interBuf.not()), 9)
+    .where(lossSingle, 3)
+    .where(gainSingle, 4)
+    .where(lossRecov, 5)
+    .where(gainLoss, 6)
+    .where(unqual, 7)
+    .where(unqual.and(lossC.gte(1)), 10)
+    .where(ever.and(f.gte(3)), 8)
+    .rename('traj').selfMask()
+    .reproject(GRID);
+
+  var tjClean = tj.updateMask(
+    tj.connectedPixelCount(64, PATCH_DIAGONAL).gte(minPatch));
+
+  tj      = tj.clip(AOI);
+  tjClean = tjClean.clip(AOI);
+
+  return {
+    traj: tj, clean: tjClean,
+    lossYear: lossYearU.selfMask().rename('loss_year').reproject(GRID),
+    gainYear: gainYearU.selfMask().rename('gain_year').reproject(GRID)
+  };
+}
+
+var R = buildTraj(MIN_DURATION, K, MIN_PATCH_PIX, EDGE_BUFFER);
+
+var lossY = R.lossYear.unmask(0).toInt();
+var gainY = R.gainYear.unmask(0).toInt();
+
+
+/*====================================================================
+ * 3. CONSISTENCY CHECK
+ *===================================================================*/
+
+print('--- Consistency check ---');
+print('Filtered class areas (ha) — must equal the sweep script\'s ' +
+      '"After contiguity filter" table exactly:', classAreas(R.clean));
+
+
+/*====================================================================
+ * 4. CORE-PIXEL RULE
+ *===================================================================*/
+
+var cls      = R.clean.unmask(0);   // 0 = outside AOI or filtered out
+var isStable = cls.eq(1).or(cls.eq(2)).or(cls.eq(9));
+var isLoss   = cls.eq(3).or(cls.eq(5)).or(cls.eq(10));
+var isGain   = cls.eq(4);
+
+// focal_min over the 3x3 block: 1 only if all 9 pixels are in the group.
+var SQ1 = {radius: 1, kernelType: 'square', units: 'pixels'};
+var core = ee.Image(0)
+  .where(isStable, isStable.focal_min(SQ1).reproject(GRID))
+  .where(isLoss,   isLoss.focal_min(SQ1).reproject(GRID))
+  .where(isGain,   isGain.focal_min(SQ1).reproject(GRID));
+
+var needCore = ee.Image(0);
+SAMPLE_CLASSES.forEach(function (k) {
+  if (CORE_ONLY[k]) { needCore = needCore.where(cls.eq(k), 1); }
+});
+
+var eligCls = R.clean.updateMask(needCore.not().or(core));
+
+print('Eligible area per class after the core rule (ha), CORE_ONLY = ' +
+      JSON.stringify(CORE_ONLY) + ':', classAreas(eligCls));
+
+
+/*====================================================================
+ * 5. LOSS-YEAR HISTOGRAM  (filtered classes 3 + 5 + 10, before core rule)
+ *===================================================================*/
+
+var lossGroups = ee.List(rr(
+  ee.Image.pixelArea().divide(1e4).addBands(lossY.updateMask(isLoss)),
+  ee.Reducer.sum().group({groupField: 1, groupName: 'year'})
+).get('groups'));
+
+var lossHist = ee.FeatureCollection(lossGroups.map(function (g) {
+  g = ee.Dictionary(g);
+  return ee.Feature(null, {
+    year:    ee.Number(g.get('year')),
+    area_ha: ee.Number(g.get('sum')).multiply(10).round().divide(10)
+  });
+}));
+
+print('--- Loss by loss year, filtered classes 3 + 5 + 10 ---');
+print('Area (ha) per loss year:', ee.Dictionary.fromLists(
+  lossHist.aggregate_array('year').map(function (v) {
+    return ee.Number(v).format('%d');
+  }),
+  lossHist.aggregate_array('area_ha')));
+
+print(ui.Chart.feature.byFeature(lossHist, 'year', ['area_ha'])
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: 'Loss area by loss year (filtered classes 3 + 5 + 10)',
+    hAxis: {title: 'Loss year', format: '####'},
+    vAxis: {title: 'Hectares'}, legend: {position: 'none'}
+  }));
+
+
+/*====================================================================
+ * 6. CANDIDATE DRAW
+ *===================================================================*/
+
+var CAP_S = {}, QUOTA_S = {}, RESERVE_S = {}, SEP_S = {};
+SAMPLE_CLASSES.forEach(function (k) {
+  CAP_S[String(k)]     = N_POINTS[k] + RESERVE[k];
+  QUOTA_S[String(k)]   = N_POINTS[k];
+  RESERVE_S[String(k)] = RESERVE[k];
+  SEP_S[String(k)]     = MIN_SEP_PIX[k];
+});
+var CAP_EE   = ee.Dictionary(CAP_S);
+var QUOTA_EE = ee.Dictionary(QUOTA_S);
+var SEP_EE   = ee.Dictionary(SEP_S);
+var YCAP     = (MAX_PER_LOSS_YEAR > 0) ? MAX_PER_LOSS_YEAR : 1e9;
+
+var sampleImg = eligCls.rename('cls')
+  .addBands(lossY.rename('loss_year'))
+  .addBands(gainY.rename('gain_year'))
+  .toInt().reproject(GRID);
+
+var cands = sampleImg.stratifiedSample({
+  numPoints:   0,
+  classBand:   'cls',
+  region:      AOI,
+  projection:  NATIVE,
+  seed:        SEED,
+  classValues: SAMPLE_CLASSES,
+  classPoints: SAMPLE_CLASSES.map(function (k) {
+    return (N_POINTS[k] + RESERVE[k]) * OVERSAMPLE;
+  }),
+  geometries:  true,
+  tileScale:   4
+});
+
+// Per candidate: spacing group and value, loss-year key and cap, row /
+// column on the GMW grid, lon / lat. Class 10 is ordered first so it
+// claims space before class 3.
+cands = cands.randomColumn('r', SEED).map(function (f) {
+  var c      = ee.Number(f.get('cls'));
+  var q      = c.format('%d');
+  var isTen  = c.eq(10);
+  var isLossC = ee.List(LOSS_CLASSES).contains(c);
+  var cN = ee.List(f.geometry().transform(GRID.crs, 0.01).coordinates());
+  var cW = ee.List(f.geometry().transform('EPSG:4326', 0.01).coordinates());
+  return f.set({
+    qclass: q,
+    sgroup: ee.Algorithms.If(isTen, '3', q),
+    sep:    SEP_EE.get(q),
+    ykey:   ee.Algorithms.If(isLossC,
+              ee.String('L').cat(ee.Number(f.get('loss_year')).format('%d')),
+              'none'),
+    ycap:   ee.Algorithms.If(isLossC, YCAP, 1e9),
+    key:    ee.Number(ee.Algorithms.If(isTen, 0, 1)).add(f.get('r')),
+    col:    ee.Number(cN.get(0)).subtract(X0).divide(DX).floor(),
+    row:    ee.Number(cN.get(1)).subtract(Y0).divide(DY).floor(),
+    lon:    ee.Number(cW.get(0)).multiply(1e6).round().divide(1e6),
+    lat:    ee.Number(cW.get(1)).multiply(1e6).round().divide(1e6)
+  });
+});
+
+
+/*====================================================================
+ * 7. SELECTION
+ *
+ * Candidates in 'key' order. Accept if
+ *   the class has fewer than N_POINTS + RESERVE points,
+ *   its loss year has fewer than MAX_PER_LOSS_YEAR loss points,
+ *   no accepted point of the same spacing group lies within the
+ *   candidate's MIN_SEP_PIX rows and columns.
+ * The rank within the class decides main (<= N_POINTS) or reserve.
+ *===================================================================*/
+
+var candList = cands.sort('key').toList(cands.size());
+
+var state = ee.Dictionary(candList.iterate(function (f, st) {
+  f  = ee.Feature(f);
+  st = ee.Dictionary(st);
+  var n   = ee.Dictionary(st.get('n'));
+  var ny  = ee.Dictionary(st.get('ny'));
+  var acc = ee.Dictionary(st.get('acc'));
+  var q   = ee.String(f.get('qclass'));
+  var g   = ee.String(f.get('sgroup'));
+  var yk  = ee.String(f.get('ykey'));
+  var sep = ee.Number(f.get('sep'));
+  var row = ee.Number(f.get('row'));
+  var col = ee.Number(f.get('col'));
+  var nq  = ee.Number(n.get(q, 0));
+  var nyk = ee.Number(ny.get(yk, 0));
+  var pts = ee.List(acc.get(g, ee.List([])));
+
+  var close = ee.Number(ee.Algorithms.If(pts.size().gt(0),
+    pts.map(function (p) {
+      p = ee.List(p);
+      return ee.Number(p.get(0)).subtract(row).abs()
+        .max(ee.Number(p.get(1)).subtract(col).abs())
+        .lte(sep);
+    }).reduce(ee.Reducer.max()),
+    0));
+
+  var ok = nq.lt(ee.Number(CAP_EE.get(q)))
+    .and(nyk.lt(ee.Number(f.get('ycap'))))
+    .and(close.not());
+
+  return ee.Algorithms.If(ok,
+    st.set('sel', ee.List(st.get('sel')).add(f.set('rank', nq.add(1))))
+      .set('n',   n.set(q, nq.add(1)))
+      .set('ny',  ny.set(yk, nyk.add(1)))
+      .set('acc', acc.set(g, pts.add(ee.List([row, col])))),
+    st);
+}, ee.Dictionary({
+  sel: ee.List([]), n: ee.Dictionary({}), ny: ee.Dictionary({}),
+  acc: ee.Dictionary({})
+})));
+
+
+/*====================================================================
+ * 8. ATTRIBUTES
+ *===================================================================*/
+
+var points = ee.FeatureCollection(ee.List(state.get('sel'))).map(function (f) {
+  var c    = ee.Number(f.get('cls'));
+  var q    = ee.String(f.get('qclass'));
+  var rank = ee.Number(f.get('rank'));
+  return f.set({
+    point_id: ee.String('c').cat(q).cat('_').cat(rank.format('%03d')),
+    traj:     ee.Algorithms.If(c.eq(10), 3, c),
+    traj_src: c,
+    reserve:  rank.gt(ee.Number(QUOTA_EE.get(q)))
+  });
+}).sort('point_id');
+
+
+/*====================================================================
+ * 9. MAP AND REPORT
+ *===================================================================*/
+
+var COL = {};
+Object.keys(CLASS_COLORS).forEach(function (k) {
+  COL[k] = CLASS_COLORS[k].replace('#', '');
+});
+var COL_EE = ee.Dictionary(COL);
+
+var trajPalette = [
+  COL['1'], COL['2'], COL['3'], COL['4'], COL['5'],
+  '6a3d9a',  // 6 gain then loss
+  '999999',  // 7 changed, fails K
+  'e000ff',  // 8 noisy
+  '4f7942',  // 9 transition band
+  'b15928'   // 10 loss, 2nd change unverified
+];
+
+Map.addLayer(R.clean, {min: 1, max: 10, palette: trajPalette},
+  'Trajectory class (filtered)', true, 0.6);
+Map.addLayer(eligCls, {min: 1, max: 10, palette: trajPalette},
+  'Eligible pixels (after core rule)', false);
+
+// Filled = main, hollow = reserve, triangle = from class 10.
+var pointsStyled = points.map(function (f) {
+  var col = ee.String(COL_EE.get(ee.Number(f.get('traj')).format('%d')));
+  return f.set('style', {
+    color: col, width: 2, pointSize: 6,
+    fillColor: ee.Algorithms.If(ee.Number(f.get('reserve')).eq(1),
+                                '00000000', col.cat('cc')),
+    pointShape: ee.Algorithms.If(ee.Number(f.get('traj_src')).eq(10),
+                                 'triangle', 'circle')
+  });
+}).style({styleProperty: 'style'});
+
+Map.addLayer(pointsStyled, {}, 'Sample points');
+Map.addLayer(ee.Image().paint(AOI, 0, 2), {palette: 'yellow'}, 'AOI', false);
+
+var mainPts = points.filter(ee.Filter.eq('reserve', 0));
+var resPts  = points.filter(ee.Filter.eq('reserve', 1));
+var gotMain = ee.Dictionary(mainPts.aggregate_histogram('qclass'));
+var gotRes  = ee.Dictionary(resPts.aggregate_histogram('qclass'));
+
+print('--- Selection (seed ' + SEED + ') ---');
+print('MIN_SEP_PIX: ' + JSON.stringify(MIN_SEP_PIX) +
+      ' | MAX_PER_LOSS_YEAR: ' + MAX_PER_LOSS_YEAR +
+      ' | OVERSAMPLE: ' + OVERSAMPLE);
+print('Requested main:', QUOTA_EE);
+print('Achieved main:', gotMain);
+print('Main shortfall (requested - achieved):', QUOTA_EE.map(function (k, v) {
+  return ee.Number(v).subtract(ee.Number(gotMain.get(k, 0)));
+}));
+print('Requested reserve:', ee.Dictionary(RESERVE_S));
+print('Achieved reserve:', gotRes);
+print('Reserve shortfall (requested - achieved):',
+  ee.Dictionary(RESERVE_S).map(function (k, v) {
+    return ee.Number(v).subtract(ee.Number(gotRes.get(k, 0)));
+  }));
+print('Main loss points (traj 3 + 5) by loss year:',
+  mainPts.filter(ee.Filter.inList('traj', [3, 5]))
+    .aggregate_histogram('loss_year'));
+print('All loss points incl. reserve (traj 3 + 5) by loss year:',
+  points.filter(ee.Filter.inList('traj', [3, 5]))
+    .aggregate_histogram('loss_year'));
+
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px 15px'}});
+legend.add(ui.Label({value: 'Sample points',
+  style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 6px 0'}}));
+[{c: CLASS_COLORS[1], l: '1 Stable interior'},
+ {c: CLASS_COLORS[2], l: '2 Stable edge'},
+ {c: CLASS_COLORS[3], l: '3 Loss (triangle = from class 10)'},
+ {c: CLASS_COLORS[4], l: '4 Gain'},
+ {c: CLASS_COLORS[5], l: '5 Loss then recovery'}
+].forEach(function (it) {
+  legend.add(ui.Panel({
+    widgets: [
+      ui.Label({style: {backgroundColor: it.c, padding: '8px', margin: '0 0 4px 0'}}),
+      ui.Label({value: it.l, style: {margin: '0 0 4px 6px'}})
+    ],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  }));
+});
+legend.add(ui.Label({value: 'Filled = main, hollow = reserve',
+  style: {fontSize: '11px', margin: '4px 0 0 0'}}));
+Map.add(legend);
+
+
+/*====================================================================
+ * 10. EXPORTS
+ *===================================================================*/
+
+Export.table.toDrive({
+  collection:  points,
+  description: EXPORT_NAME,
+  folder:      EXPORT_FOLDER,
+  fileFormat:  'CSV',
+  selectors:   ['point_id', 'traj', 'traj_src', 'loss_year', 'gain_year',
+                'reserve', 'lon', 'lat']
+});
+
+// One row: every setting needed to reproduce the points file.
+var meta = ee.FeatureCollection([ee.Feature(null, {
+  created:           new Date().toISOString(),
+  seed:              SEED,
+  gmw_tiles:         GMW_TILE_A + ' ; ' + GMW_TILE_B,
+  years:             FIRST_YEAR + '-' + LAST_YEAR,
+  min_duration:      MIN_DURATION,
+  k:                 K,
+  min_patch_pix:     MIN_PATCH_PIX,
+  patch_diagonal:    PATCH_DIAGONAL ? 1 : 0,
+  edge_buffer_m:     EDGE_BUFFER,
+  edge_band_m:       EDGE_BAND,
+  n_points:          JSON.stringify(N_POINTS),
+  reserve:           JSON.stringify(RESERVE),
+  min_sep_pix:       JSON.stringify(MIN_SEP_PIX),
+  core_only:         JSON.stringify(CORE_ONLY),
+  max_per_loss_year: MAX_PER_LOSS_YEAR,
+  oversample:        OVERSAMPLE
+})]);
+
+Export.table.toDrive({
+  collection:  meta,
+  description: EXPORT_NAME + '_meta',
+  folder:      EXPORT_FOLDER,
+  fileFormat:  'CSV'
+});
