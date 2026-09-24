@@ -1,7 +1,0 @@
-rasterio
-scikit-gstat
-numpy
-scipy
-matplotlib
-pandas
-ipykernel
