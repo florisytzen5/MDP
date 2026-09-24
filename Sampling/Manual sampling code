@@ -50,7 +50,7 @@
  * WORKFLOW
  *   1  Set the CONFIG section. Run. Check the band-count line and the
  *      consistency table.
- *   2  Create main_pts (and optionally reserve_pts) and place markers.
+ *   2  Create main_pts (and optionally reserve_pts) and place markers in geometry section.
  *   3  Run. Fix every marker in the rejection list, rerun until empty.
  *   4  Save the script. Run the three exports in the Tasks tab.
  *   5  Freeze the markers: editing them renumbers point_id.
@@ -417,10 +417,18 @@ var sampled = sampleImg.reduceRegions({
 
 var PICK_EE = ee.List(PICK_CLASSES);
 
+// reduceRegions returns null where the image has no data (outside the
+// clipped footprint, e.g. a marker outside the AOI). Null -> 0, so such
+// markers are rejected instead of crashing the whole run.
+function num0(f, name) {
+  var v = f.get(name);
+  return ee.Number(ee.Algorithms.If(ee.Algorithms.IsEqual(v, null), 0, v)).toInt();
+}
+
 var checked = sampled.map(function (f) {
   var inAoi = ee.Number(f.get('in_aoi'));
-  var cls   = ee.Number(f.get('cls')).toInt();
-  var raw   = ee.Number(f.get('cls_raw')).toInt();
+  var cls   = num0(f, 'cls');
+  var raw   = num0(f, 'cls_raw');
   var pick  = ee.Number(ee.Algorithms.If(PICK_EE.contains(cls), 1, 0));
   var reason0 = ee.Algorithms.If(inAoi.eq(0), 'outside_aoi',
                 ee.Algorithms.If(raw.eq(0),   'no_class',
@@ -428,8 +436,8 @@ var checked = sampled.map(function (f) {
                 ee.Algorithms.If(pick.eq(0),  'class_not_pickable', 'ok'))));
   return f.set({
     cls: cls, cls_raw: raw,
-    loss_year: ee.Number(f.get('loss_year')).toInt(),
-    gain_year: ee.Number(f.get('gain_year')).toInt(),
+    loss_year: num0(f, 'loss_year'),
+    gain_year: num0(f, 'gain_year'),
     reason0: reason0,
     ok0: inAoi.eq(1).and(raw.gt(0)).and(cls.gt(0)).and(pick.eq(1))
   });
