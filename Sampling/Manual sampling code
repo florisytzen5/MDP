@@ -97,7 +97,7 @@ var CLASS_INFO = {
   10: {color: '#b15928', label: '10 Loss, 2nd change unverified'}
 };
 
-var EXPORT_FOLDER = 'GEE_exports';
+var EXPORT_FOLDER = 'GEE_exports_sampling';
 var EXPORT_NAME   = 'Sisal_manual_points';
 
 var AOI = ee.Geometry.Polygon(
