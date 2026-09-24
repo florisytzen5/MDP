@@ -107,7 +107,7 @@ var CLASS_COLORS = {
   1: '#12301f', 2: '#9fbf6a', 3: '#e31a1c', 4: '#1f78b4', 5: '#ff7f00'
 };
 
-var EXPORT_FOLDER = 'GEE_exports';
+var EXPORT_FOLDER = 'GEE_exports_sampling';
 var EXPORT_NAME   = 'Sisal_sample_points';
 
 var AOI = ee.Geometry.Polygon(
